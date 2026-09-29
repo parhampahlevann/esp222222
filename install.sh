@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  ESP Tunnel Manager  -  point-to-point tunnel over IP protocol 50 (ESP)
+#                         + Rathole reverse tunnel carried inside it
 #
-#    Iran server   : 10.10.10.2   (menu option 1)
-#    Kharej client : 10.10.10.1   (menu option 2)
+#    Iran server   : 10.10.10.2   (menu option 1)   rathole SERVER
+#    Kharej client : 10.10.10.1   (menu option 2)   rathole CLIENT
 #
 #  How it works
 #   * Linux kernel XFRM (IPsec ESP) + an "xfrm interface" (espt0) on each side.
@@ -13,37 +14,37 @@
 #     Per-direction session keys are derived from it and rotate every hour
 #     with zero downtime (both sides derive the same keys from the UTC clock;
 #     the previous/current/next hour inbound SAs are always loaded).
-#   * The Iran server DNATs the chosen ports to 10.10.10.1 through the tunnel.
-#     The xfrm policies only allow traffic between 10.10.10.2 <-> 10.10.10.1.
+#   * The xfrm policies only allow traffic between 10.10.10.2 <-> 10.10.10.1.
 #   * Optional fallback transport: ESP-in-UDP (for NAT / when protocol 50 is
 #     blocked by the datacenter or ISP).
 #
-#  v1.1 watchdog upgrade
-#   * New: asymmetric-blackout detector - flags "outbound traffic flowing but
-#     nothing received" (the exact pattern seen in a real 24h-interval outage:
-#     TX counters climbing, RX frozen at 0 on both ends) and rebuilds early,
-#     instead of waiting for the plain ping-timeout path.
-#   * New: xfrm kernel error counters (/proc/net/xfrm_stat) are polled every
-#     cycle; any new non-zero counter is logged immediately as an early warning
-#     and included in the forensic snapshot.
-#   * New: forensic snapshot capture (xfrm state, interface counters, xfrm
-#     error counters, last 40 *scoped* kernel log lines via `journalctl -k`)
-#     is written to the service log right before every watchdog-triggered
-#     rebuild, so the actual next occurrence is diagnosable after the fact.
-#   * New: unconditional preventive rebuild every FORCE_REBUILD_SEC (default
-#     12h, 0 = disabled) - a safety net independent of whether a problem was
-#     even detected. Configurable from the menu, no separate cron/timer unit
-#     needed. Both sides derive keys purely from (master key, UTC hour), so
-#     a rebuild on either side needs no coordination with the other.
-#   * New: on-demand health check (Live Log -> option 4): packet loss, xfrm
-#     error counters, loaded SA count, plain verdict.
+#  v2.0 rathole reverse tunnel
+#   * The rathole core (official release, downloaded automatically) is installed
+#     on BOTH servers. The Kharej rathole client dials OUT to the Iran rathole
+#     server at 10.10.10.2:8090 - that connection (source 10.10.10.1) travels
+#     inside the ESP tunnel, so the reverse tunnel is encrypted by ESP and the
+#     control port is not reachable from the internet.
+#   * Port forwarding is no longer done by iptables DNAT on the Iran server.
+#     The Iran rathole server opens the public ports; every connection is pushed
+#     back through the reverse tunnel and the Kharej rathole client hands it to
+#     the local service (default target 127.0.0.1:<port>, configurable).
+#   * Rathole runs as its own systemd unit (esp-tunnel-rathole) that depends on
+#     the ESP service. Auth token and config are derived from the master key.
+#   * Installs done by older versions (iptables DNAT) keep working unchanged
+#     until you re-install (engine "dnat").
+#
+#  v1.1 watchdog (unchanged)
+#   * asymmetric-blackout detector (TX moving, RX frozen) -> early rebuild
+#   * xfrm error counters polled every cycle, forensic snapshot before rebuilds
+#   * unconditional preventive rebuild every FORCE_REBUILD_SEC (default 12h)
+#   * on-demand health check (Live Log -> option 4)
 #
 #  Usage:  bash esp-tunnel.sh        (interactive menu, run as root)
 #          esp-tunnel                (after first install)
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="1.1"
+VERSION="2.0"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -52,6 +53,19 @@ SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 RUN_DIR="/run/${APP}"
 REG="${RUN_DIR}/sa.list"
 UDP_PID_FILE="${RUN_DIR}/udp.pid"
+
+# rathole (reverse tunnel engine)
+LIB_DIR="/usr/local/lib/${APP}"
+RH_BIN="${LIB_DIR}/rathole"
+RH_CONF="${CONF_DIR}/rathole.toml"
+RH_UNIT="${APP}-rathole"
+RH_UNIT_FILE="/etc/systemd/system/${RH_UNIT}.service"
+RH_REPO="rathole-org/rathole"
+RH_FALLBACK_TAG="v0.5.0"          # used when the latest tag cannot be resolved
+DEFAULT_RH_PORT=8090              # control port, bound on the tunnel address only
+RH_HB_INTERVAL=15                 # server heartbeat (s)  - must stay below RH_HB_TIMEOUT
+RH_HB_TIMEOUT=45                  # client heartbeat timeout (s)
+MAX_FWD_PORTS=300                 # rathole needs one service per port
 
 IF_NAME="espt0"
 IF_ID=42
@@ -72,6 +86,7 @@ PORTS=""; FWD_PROTO="both"
 LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU_ESP"
 LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
 FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
+ENGINE=""; RH_PORT="$DEFAULT_RH_PORT"; RH_TARGET="127.0.0.1"; RH_AUTH=""
 
 # ---- daemon watchdog state (globals; meaningful only while cmd_daemon runs) --
 RX0=0; TX0=0; RX_STALL_START=0; LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; XPREV=""
@@ -170,6 +185,20 @@ ports_include() {   # ports_include "1080,8000-8100" 8050
   return 1
 }
 
+# "1080,8000-8002" -> one port per line, sorted, no duplicates
+expand_ports() {
+  local spec a b p
+  local -a specs=()
+  IFS=',' read -ra specs <<< "$1"
+  {
+    for spec in "${specs[@]}"; do
+      [[ -z $spec ]] && continue
+      if [[ $spec == *-* ]]; then a=${spec%-*}; b=${spec#*-}; else a=$spec; b=$spec; fi
+      for (( p = 10#$a; p <= 10#$b; p++ )); do echo "$p"; done
+    done
+  } | sort -nu
+}
+
 ssh_ports() {
   local p
   p=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}')
@@ -208,17 +237,21 @@ detect_public_ip() {
 # ------------------------------------------------------------------------------
 load_config() {
   [[ -r $CONF ]] || return 1
+  ENGINE=""; RH_PORT=""; RH_TARGET=""
   # shellcheck disable=SC1090
   source "$CONF"
   MODE=${MODE:-esp}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
   FORCE_REBUILD_SEC=${FORCE_REBUILD_SEC:-$DEFAULT_FORCE_REBUILD_SEC}
   RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
+  # configs written by esp-tunnel 1.x have no engine: they keep the iptables DNAT behaviour
+  ENGINE=${ENGINE:-dnat}; RH_PORT=${RH_PORT:-$DEFAULT_RH_PORT}; RH_TARGET=${RH_TARGET:-127.0.0.1}
   case $ROLE in
     iran)   LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; PEER_PUB=$KHAREJ_IP; OUT_LABEL=i2k; IN_LABEL=k2i ;;
     kharej) LOCAL_INNER=$IP_KHAREJ; PEER_INNER=$IP_IRAN;   PEER_PUB=$IRAN_IP;   OUT_LABEL=k2i; IN_LABEL=i2k ;;
     *) return 1 ;;
   esac
   [[ -n $MASTER && -n $PEER_PUB ]] || return 1
+  RH_AUTH=$(kdf "${MASTER}|rathole|auth" | cut -c1-40)
   if [[ $MODE == udp ]]; then MTU=$MTU_UDP; else MTU=$MTU_ESP; fi
   return 0
 }
@@ -239,34 +272,50 @@ write_config() {
       printf 'FWD_PROTO=%q\n' "$FWD_PROTO"
       printf 'FORCE_REBUILD_SEC=%q\n' "$FORCE_REBUILD_SEC"
       printf 'RX_STALL_SEC=%q\n'      "$RX_STALL_SEC"
+      printf 'ENGINE=%q\n'    "$ENGINE"
+      printf 'RH_PORT=%q\n'   "$RH_PORT"
+      printf 'RH_TARGET=%q\n' "$RH_TARGET"
     } > "$CONF"
   )
   chmod 600 "$CONF"
 }
 
-# token = base64( v1|master|iran_ip|kharej_ip|mode|udp_port|ports|proto|checksum )
+# token v2 = base64( v2|master|iran_ip|kharej_ip|mode|udp_port|ports|proto|engine|rh_port|checksum )
+# (v1 tokens from older versions are still accepted: they mean engine "dnat")
 make_token() {
   local payload chk
-  payload="v1|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}"
+  payload="v2|${MASTER}|${IRAN_IP}|${KHAREJ_IP}|${MODE}|${UDP_PORT}|${PORTS}|${FWD_PROTO}|${ENGINE}|${RH_PORT}"
   chk=$(printf '%s' "$payload" | sha256sum | cut -c1-6)
   printf '%s|%s' "$payload" "$chk" | base64 -w0
 }
 
-T_MASTER=""; T_IRAN=""; T_KHAREJ=""; T_MODE=""; T_UDP=""; T_PORTS=""; T_PROTO=""
+T_MASTER=""; T_IRAN=""; T_KHAREJ=""; T_MODE=""; T_UDP=""; T_PORTS=""; T_PROTO=""; T_ENGINE=""; T_RHPORT=""
 parse_token() {
-  local t dec ver chk want
+  local t dec n chk want payload
+  local -a F=()
   t=$(tr -d '[:space:]' <<<"$1")
   [[ -n $t ]] || return 1
   dec=$(base64 -d <<<"$t" 2>/dev/null) || return 1
-  IFS='|' read -r ver T_MASTER T_IRAN T_KHAREJ T_MODE T_UDP T_PORTS T_PROTO chk <<<"$dec"
-  [[ $ver == v1 ]] || return 1
-  want=$(printf '%s' "${ver}|${T_MASTER}|${T_IRAN}|${T_KHAREJ}|${T_MODE}|${T_UDP}|${T_PORTS}|${T_PROTO}" | sha256sum | cut -c1-6)
+  IFS='|' read -ra F <<< "$dec"
+  n=${#F[@]}
+  case ${F[0]} in
+    v1) (( n == 9 ))  || return 1 ;;
+    v2) (( n == 11 )) || return 1 ;;
+    *)  return 1 ;;
+  esac
+  chk=${F[n-1]}
+  payload=$(IFS='|'; printf '%s' "${F[*]:0:n-1}")
+  want=$(printf '%s' "$payload" | sha256sum | cut -c1-6)
   [[ $chk == "$want" ]] || return 1
+  T_MASTER=${F[1]}; T_IRAN=${F[2]}; T_KHAREJ=${F[3]}; T_MODE=${F[4]}; T_UDP=${F[5]}; T_PORTS=${F[6]}; T_PROTO=${F[7]}
+  if [[ ${F[0]} == v2 ]]; then T_ENGINE=${F[8]}; T_RHPORT=${F[9]}; else T_ENGINE=dnat; T_RHPORT=$DEFAULT_RH_PORT; fi
   [[ $T_MASTER =~ ^[0-9a-f]{64}$ ]] || return 1
   valid_ip "$T_IRAN" && valid_ip "$T_KHAREJ" || return 1
   [[ $T_MODE == esp || $T_MODE == udp ]] || return 1
   valid_port "$T_UDP" || return 1
   [[ $T_PROTO == tcp || $T_PROTO == udp || $T_PROTO == both ]] || return 1
+  [[ $T_ENGINE == rathole || $T_ENGINE == dnat ]] || return 1
+  valid_port "$T_RHPORT" || return 1
   norm_ports "$T_PORTS" >/dev/null || return 1
   return 0
 }
@@ -282,6 +331,9 @@ ensure_deps() {
     have "$c" || missing+=("$c")
   done
   if [[ $MODE == udp ]] && ! have python3; then missing+=(python3); fi
+  if [[ $ENGINE == rathole ]]; then
+    for c in unzip curl; do have "$c" || missing+=("$c"); done
+  fi
   (( ${#missing[@]} == 0 )) && return 0
 
   if   have apt-get; then pm=apt
@@ -294,7 +346,7 @@ ensure_deps() {
     case $c in
       ip|ss)   [[ $pm == apt ]] && pkgs+=(iproute2) || pkgs+=(iproute) ;;
       ping)    [[ $pm == apt ]] && pkgs+=(iputils-ping) || pkgs+=(iputils) ;;
-      iptables|python3) pkgs+=("$c") ;;
+      iptables|python3|unzip|curl) pkgs+=("$c") ;;
       *)       pkgs+=(coreutils) ;;
     esac
   done
@@ -383,6 +435,10 @@ fw_apply() {
   else
     ipt -A ESPT_IN -p 50 -s "$PEER_PUB" -j ACCEPT
   fi
+  if [[ $ROLE == iran && $ENGINE == rathole ]]; then
+    # the rathole control port lives on the tunnel address only - never answer it from the WAN side
+    ipt -I ESPT_IN 1 -i "$WAN_DEV" -p tcp -d "$IP_IRAN" --dport "$RH_PORT" -j DROP
+  fi
 
   fw_chain_reset filter ESPT_FWD FORWARD
   ipt -A ESPT_FWD -i "$IF_NAME" -j ACCEPT
@@ -392,7 +448,9 @@ fw_apply() {
   fw_chain_reset mangle ESPT_MSS POSTROUTING
   ipt -t mangle -A ESPT_MSS -o "$IF_NAME" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-  if [[ $ROLE == iran ]]; then
+  # legacy engine only: iptables DNAT of the chosen ports to the Kharej tunnel address.
+  # With the rathole engine there is NO DNAT - the rathole server owns the public ports.
+  if [[ $ROLE == iran && $ENGINE == dnat ]]; then
     fw_chain_reset nat ESPT_PRE  PREROUTING
     fw_chain_reset nat ESPT_POST POSTROUTING
     case $FWD_PROTO in
@@ -577,8 +635,253 @@ setup_all() {
   if [[ $MODE == udp ]]; then udp_helper_start || return 1; fi
   sysctl_apply
   fw_apply
-  log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU epoch=$CUR_EPOCH"
+  log "tunnel up: role=$ROLE ${LOCAL_INNER} <-> ${PEER_INNER}  transport=$MODE  engine=$ENGINE  local=$LOCAL_ADDR($WAN_DEV) peer=$PEER_PUB mtu=$MTU epoch=$CUR_EPOCH"
   return 0
+}
+
+# ------------------------------------------------------------------------------
+#  Rathole core: download, config, service
+# ------------------------------------------------------------------------------
+rh_arch() {   # asset suffix of the official release for this CPU
+  case $(uname -m) in
+    x86_64|amd64)  echo "x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
+    armv7l|armv7)  echo "armv7-unknown-linux-musleabihf" ;;
+    *) return 1 ;;
+  esac
+}
+
+rh_works() { [[ -x $1 ]] && "$1" --version >/dev/null 2>&1; }
+
+rh_version() { "$RH_BIN" --version 2>/dev/null | awk '/Build Version/{print $3; exit}'; }
+
+# latest release tag WITHOUT the rate-limited GitHub API (follows the /releases/latest redirect)
+rh_latest_tag() {
+  local tag
+  have curl || return 1
+  tag=$(curl -fsSL --max-time 15 -o /dev/null -w '%{url_effective}' "https://github.com/${RH_REPO}/releases/latest" 2>/dev/null | sed 's#.*/tag/##')
+  [[ $tag =~ ^v[0-9]+(\.[0-9]+)+$ ]] && echo "$tag"
+}
+
+rh_install_from() {   # rh_install_from <zip-or-binary>  -> $RH_BIN
+  local f=$1 tmp
+  [[ -f $f ]] || { err "File not found: $f"; return 1; }
+  tmp=$(mktemp -d)
+  if [[ $(head -c2 "$f" 2>/dev/null) == PK ]]; then
+    unzip -o -q "$f" -d "$tmp" 2>/dev/null || { err "Cannot unzip $f"; rm -rf "$tmp"; return 1; }
+    f=$(find "$tmp" -type f -name rathole | head -n1)
+    [[ -n $f ]] || { err "No 'rathole' binary inside the archive."; rm -rf "$tmp"; return 1; }
+  fi
+  mkdir -p "$LIB_DIR"
+  install -m 755 "$f" "${RH_BIN}.new" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  if ! rh_works "${RH_BIN}.new"; then
+    rm -f "${RH_BIN}.new"
+    err "This rathole binary does not run on this system (wrong CPU, or glibc too old)."
+    return 1
+  fi
+  mv -f "${RH_BIN}.new" "$RH_BIN"      # atomic: safe even while the old binary is running
+}
+
+rh_fetch() {   # rh_fetch <url> -> installs it
+  local tmp rc
+  tmp=$(mktemp)
+  curl -fL -sS --retry 2 --connect-timeout 10 --max-time 180 -o "$tmp" "$1" && rh_install_from "$tmp"
+  rc=$?
+  rm -f "$tmp"
+  return $rc
+}
+
+# ensure_rathole [force]   force = download again even if a core is already installed
+ensure_rathole() {
+  local force=${1:-} tag arch ans
+  if [[ -z $force ]] && rh_works "$RH_BIN"; then
+    ok "rathole core is already installed (v$(rh_version))."
+    return 0
+  fi
+  # a rathole that another script already put on this server can be reused - handy when GitHub is blocked
+  if [[ -z $force ]] && have rathole && rh_install_from "$(command -v rathole)"; then
+    ok "Reused the rathole found in PATH (v$(rh_version))."
+    return 0
+  fi
+  arch=$(rh_arch) || { err "Unsupported CPU architecture: $(uname -m)"; return 1; }
+  tag=$(rh_latest_tag)
+  if [[ -n $tag ]]; then
+    info "Downloading rathole ${tag} (${arch})..."
+    if rh_fetch "https://github.com/${RH_REPO}/releases/download/${tag}/rathole-${arch}.zip"; then
+      ok "rathole ${tag} installed."; return 0
+    fi
+  fi
+  if [[ $tag != "$RH_FALLBACK_TAG" ]]; then
+    info "Trying rathole ${RH_FALLBACK_TAG}..."
+    if rh_fetch "https://github.com/${RH_REPO}/releases/download/${RH_FALLBACK_TAG}/rathole-${arch}.zip"; then
+      ok "rathole ${RH_FALLBACK_TAG} installed."; return 0
+    fi
+  fi
+  warn "Could not download rathole (is GitHub reachable from this server?)."
+  echo "Give a direct URL (a mirror) or a local path to a rathole zip/binary you uploaded (scp), or press Enter to abort."
+  read -r -p "URL or path: " ans
+  [[ -n $ans ]] || return 1
+  if [[ $ans =~ ^https?:// ]]; then rh_fetch "$ans"; else rh_install_from "$ans"; fi || return 1
+  ok "rathole installed (v$(rh_version))."
+  return 0
+}
+
+# ports that are already listening on this server (rathole of THIS tunnel excluded)
+busy_ports() {   # busy_ports "<norm ports>" -> space separated list
+  local mp used p
+  mp=$(systemctl show -p MainPID --value "$RH_UNIT" 2>/dev/null); mp=${mp:-0}
+  used=$(ss -Hltunp 2>/dev/null | awk -v mp="$mp" '
+    mp != 0 && index($0, "pid=" mp ",") { next }
+    { n = split($5, a, ":"); print a[n] }' | sort -u)
+  for p in $(expand_ports "$1"); do
+    grep -qx "$p" <<< "$used" && printf '%s ' "$p"
+  done
+  return 0
+}
+
+rh_write_config() {
+  local p pr
+  local -a protos=() plist=()
+  [[ -n $RH_AUTH && -n $PORTS ]] || { log "ERROR: rathole config needs the master key and a port list"; return 1; }
+  case $FWD_PROTO in tcp) protos=(tcp) ;; udp) protos=(udp) ;; *) protos=(tcp udp) ;; esac
+  mapfile -t plist < <(expand_ports "$PORTS")
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+  (
+    umask 077
+    {
+      if [[ $ROLE == iran ]]; then
+        cat <<EOF
+# generated by ${APP} - changes are overwritten
+[server]
+bind_addr = "${LOCAL_INNER}:${RH_PORT}"
+default_token = "${RH_AUTH}"
+heartbeat_interval = ${RH_HB_INTERVAL}
+
+[server.transport]
+type = "tcp"
+
+[server.transport.tcp]
+nodelay = true
+keepalive_secs = 20
+keepalive_interval = 8
+EOF
+        for pr in "${protos[@]}"; do
+          for p in "${plist[@]}"; do
+            printf '\n[server.services.%s_%s]\ntype = "%s"\nbind_addr = "0.0.0.0:%s"\n' "$pr" "$p" "$pr" "$p"
+          done
+        done
+      else
+        cat <<EOF
+# generated by ${APP} - changes are overwritten
+[client]
+remote_addr = "${PEER_INNER}:${RH_PORT}"
+default_token = "${RH_AUTH}"
+heartbeat_timeout = ${RH_HB_TIMEOUT}
+retry_interval = 1
+
+[client.transport]
+type = "tcp"
+
+[client.transport.tcp]
+nodelay = true
+keepalive_secs = 20
+keepalive_interval = 8
+EOF
+        for pr in "${protos[@]}"; do
+          for p in "${plist[@]}"; do
+            printf '\n[client.services.%s_%s]\ntype = "%s"\nlocal_addr = "%s:%s"\n' "$pr" "$p" "$pr" "$RH_TARGET" "$p"
+          done
+        done
+      fi
+    } > "$RH_CONF"
+  )
+  chmod 600 "$RH_CONF"
+}
+
+write_rh_unit() {
+  cat > "$RH_UNIT_FILE" <<EOF
+[Unit]
+Description=Rathole reverse tunnel over the ESP tunnel (${APP})
+After=network-online.target ${APP}.service
+Requires=${APP}.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=${BIN} rh-run
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# runs under systemd: wait for the tunnel address, then become rathole
+cmd_rh_run() {
+  local i mode
+  load_config || { log "ERROR: missing or invalid $CONF"; exit 1; }
+  [[ $ENGINE == rathole ]] || { log "ERROR: engine is '$ENGINE', not rathole"; exit 1; }
+  rh_works "$RH_BIN" || { log "ERROR: rathole core missing at $RH_BIN (menu option 10)"; exit 1; }
+  [[ -s $RH_CONF ]] || rh_write_config || exit 1
+  for i in $(seq 1 60); do
+    ip -4 addr show dev "$IF_NAME" 2>/dev/null | grep -q "inet ${LOCAL_INNER}/" && break
+    sleep 1
+  done
+  if [[ $ROLE == iran ]]; then mode=--server; else mode=--client; fi
+  log "[rathole] starting as ${ROLE} (${mode#--}), control ${IP_IRAN}:${RH_PORT}, core v$(rh_version)"
+  exec "$RH_BIN" "$mode" "$RH_CONF"
+}
+
+start_rathole() {
+  if [[ $ENGINE != rathole ]]; then
+    systemctl disable --now "$RH_UNIT" >/dev/null 2>&1
+    rm -f "$RH_UNIT_FILE"
+    return 0
+  fi
+  rh_works "$RH_BIN" || { err "rathole core is missing - use menu option 10."; return 1; }
+  rh_write_config    || return 1
+  write_rh_unit
+  systemctl daemon-reload
+  systemctl enable "$RH_UNIT" >/dev/null 2>&1
+  systemctl restart "$RH_UNIT"
+  sleep 2
+  if systemctl is-active --quiet "$RH_UNIT"; then
+    ok "Rathole reverse-tunnel service is running."
+    return 0
+  fi
+  err "Rathole service failed to start. Last log lines:"
+  journalctl -u "$RH_UNIT" -n 25 --no-pager
+  return 1
+}
+
+# number of established TCP connections on the rathole control port (control + data channels)
+rh_conn_count() {
+  ss -Htn state established 2>/dev/null | awk -v a="${IP_IRAN}:${RH_PORT}" \
+    '{for(i=1;i<=NF;i++) if($i==a){c++; break}} END{print c+0}'
+}
+
+# "<ports listening>/<ports configured>" on the Iran server (rathole opens a port only while the client is connected)
+rh_listen_summary() {
+  local used p n=0 t=0
+  used=$(ss -Hltun 2>/dev/null | awk '{k=split($5,a,":"); print a[k]}' | sort -u)
+  for p in $(expand_ports "$PORTS"); do
+    t=$((t + 1))
+    grep -qx "$p" <<< "$used" && n=$((n + 1))
+  done
+  echo "$n/$t"
+}
+
+# after an ESP rebuild the tunnel address is recreated - make sure the rathole server still listens on it
+rh_post_rebuild() {
+  [[ $ENGINE == rathole && $ROLE == iran ]] || return 0
+  systemctl is-active --quiet "$RH_UNIT" 2>/dev/null || return 0
+  if ! ss -Hltn "sport = :${RH_PORT}" 2>/dev/null | grep -q "${LOCAL_INNER}:${RH_PORT}"; then
+    log "rathole control listener missing after the rebuild - restarting rathole"
+    systemctl restart --no-block "$RH_UNIT"
+  fi
 }
 
 # ------------------------------------------------------------------------------
@@ -629,6 +932,7 @@ watchdog_rebuild() {   # watchdog_rebuild "<reason>" [skip-forensic]
   fi
   if route_info "$PEER_PUB" && setup_all; then
     log "rebuild complete"
+    rh_post_rebuild
   else
     log "ERROR: rebuild attempt failed, will retry next cycle"
   fi
@@ -776,11 +1080,12 @@ start_service() {
   done
   if systemctl is-active --quiet "$APP" && ip link show "$IF_NAME" >/dev/null 2>&1; then
     ok "Tunnel service is running (auto-starts on boot)."
-    return 0
+  else
+    err "Service failed to start. Last log lines:"
+    journalctl -u "$APP" -n 25 --no-pager
+    return 1
   fi
-  err "Service failed to start. Last log lines:"
-  journalctl -u "$APP" -n 25 --no-pager
-  return 1
+  start_rathole
 }
 
 confirm_reinstall() {
@@ -792,10 +1097,10 @@ confirm_reinstall() {
 }
 
 ask_ports() {
-  local raw norm p spec
+  local raw norm p spec cnt busy
   local -a sp=()
   while true; do
-    read -r -p "Ports to forward through the tunnel (comma separated, e.g. 1080,443,8000-8100): " raw
+    read -r -p "Ports to open on the Iran server (comma separated, e.g. 1080,443,8000-8100): " raw
     if ! norm=$(norm_ports "$raw"); then
       err "Invalid list. Use numbers 1-65535 separated by commas (ranges like 8000-8100 are allowed)."
       continue
@@ -807,16 +1112,34 @@ ask_ports() {
         continue 2
       fi
     done
+    if [[ $ENGINE == rathole ]]; then
+      cnt=$(expand_ports "$norm" | wc -l)
+      if (( cnt > MAX_FWD_PORTS )); then
+        err "$cnt ports requested - rathole needs one service per port, the limit here is $MAX_FWD_PORTS."
+        continue
+      fi
+      if ports_include "$norm" "$RH_PORT"; then
+        err "Port $RH_PORT is reserved for the rathole control channel. Remove it."
+        continue
+      fi
+      busy=$(busy_ports "$norm")
+      if [[ -n $busy ]]; then
+        err "Already used by a local service on this server: ${busy}- rathole could not open them. Free them or choose other ports."
+        continue
+      fi
+    fi
     PORTS=$norm
     break
   done
-  IFS=',' read -ra sp <<< "$PORTS"
-  for spec in "${sp[@]}"; do
-    [[ $spec == *-* ]] && continue
-    if [[ -n $(ss -Hltun "sport = :$spec" 2>/dev/null) ]]; then
-      warn "Port $spec is already used by a local service here; after forwarding, connections to it will go to Kharej instead."
-    fi
-  done
+  if [[ $ENGINE != rathole ]]; then
+    IFS=',' read -ra sp <<< "$PORTS"
+    for spec in "${sp[@]}"; do
+      [[ $spec == *-* ]] && continue
+      if [[ -n $(ss -Hltun "sport = :$spec" 2>/dev/null) ]]; then
+        warn "Port $spec is already used by a local service here; after forwarding, connections to it will go to Kharej instead."
+      fi
+    done
+  fi
 }
 
 ask_transport() {
@@ -845,8 +1168,26 @@ ask_fwd_proto() {
   echo
   echo "Forward which protocol on those ports?"
   echo "  1) TCP + UDP (default)   2) TCP only   3) UDP only"
+  if [[ $ENGINE == rathole ]]; then
+    echo "  (rathole carries UDP inside its TCP channel - for latency-sensitive UDP prefer TCP only if you can)"
+  fi
   read -r -p "Select [1]: " c
   case $c in 2) FWD_PROTO=tcp ;; 3) FWD_PROTO=udp ;; *) FWD_PROTO=both ;; esac
+}
+
+# Kharej side: where the forwarded services listen on this server
+ask_rh_target() {
+  local a def=${RH_TARGET:-127.0.0.1}
+  echo
+  echo "Where do the forwarded services listen on THIS (Kharej) server?"
+  echo "  127.0.0.1 works for services bound to 127.0.0.1 or 0.0.0.0."
+  echo "  Use ${IP_KHAREJ} only if they listen exclusively on the tunnel address."
+  while true; do
+    read -r -p "Target address [${def}]: " a
+    a=${a:-$def}
+    if valid_ip "$a"; then RH_TARGET=$a; return 0; fi
+    err "Invalid IPv4 address."
+  done
 }
 
 print_token() {
@@ -869,10 +1210,12 @@ setup_iran() {
   install_self || { pause; return; }
 
   echo
-  info "Setting up the IRAN server side (tunnel IP ${IP_IRAN})"
+  info "Setting up the IRAN server side (tunnel IP ${IP_IRAN}, rathole server)"
+  ENGINE=rathole; RH_PORT=$DEFAULT_RH_PORT; RH_TARGET=127.0.0.1
   ask_transport
-  ensure_deps  || { pause; return; }
-  check_kernel || { pause; return; }
+  ensure_deps    || { pause; return; }
+  check_kernel   || { pause; return; }
+  ensure_rathole || { pause; return; }
 
   det=$(detect_public_ip)
   while true; do
@@ -905,8 +1248,12 @@ setup_iran() {
   start_service || { pause; return; }
   print_token
   echo
-  echo "Forwarding: [${PORTS}] (${FWD_PROTO}) on this server  ->  ${IP_KHAREJ} through the tunnel."
-  echo "Your services on Kharej must listen on 0.0.0.0 or ${IP_KHAREJ} (not only 127.0.0.1)."
+  echo "Reverse tunnel: the rathole server on this box listens on ${IP_IRAN}:${RH_PORT} (inside the ESP tunnel only)."
+  echo "Public ports [${PORTS}] (${FWD_PROTO}) are opened by rathole and carried through the tunnel to the Kharej server."
+  echo "A port opens only after the Kharej side has connected (run option 2 there with the token above)."
+  if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    warn "ufw is active here: allow the forwarded ports too (ufw allow <port>)."
+  fi
   echo "Open the ESP protocol (IP proto 50$( [[ $MODE == udp ]] && echo ", UDP ${UDP_PORT}" )) in your provider's external firewall if it has one."
   echo
   pause
@@ -918,15 +1265,18 @@ setup_kharej() {
   install_self || { pause; return; }
 
   echo
-  info "Setting up the KHAREJ client side (tunnel IP ${IP_KHAREJ})"
+  info "Setting up the KHAREJ client side (tunnel IP ${IP_KHAREJ}, rathole client)"
   while true; do
     read -r -p "Paste the token from the Iran server: " tok
     if parse_token "$tok"; then break; fi
     err "Invalid token (copy error?). Copy it again from the Iran server (menu option 8)."
   done
-  MODE=$T_MODE
+  MODE=$T_MODE; ENGINE=$T_ENGINE; RH_PORT=$T_RHPORT; RH_TARGET=127.0.0.1
   ensure_deps  || { pause; return; }
   check_kernel || { pause; return; }
+  if [[ $ENGINE == rathole ]]; then
+    ensure_rathole || { pause; return; }
+  fi
 
   IRAN_IP=$T_IRAN; KHAREJ_IP=$T_KHAREJ; UDP_PORT=$T_UDP
   PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO; MASTER=$T_MASTER; ROLE=kharej
@@ -938,6 +1288,7 @@ setup_kharej() {
     warn "This server's local address is $LOCAL_ADDR but the token says $KHAREJ_IP (NAT or wrong server?)."
     confirm "Continue anyway?" n || return
   fi
+  if [[ $ENGINE == rathole ]]; then ask_rh_target; fi
 
   write_config
   load_config
@@ -947,15 +1298,30 @@ setup_kharej() {
   info "Testing the tunnel (5 pings to ${PEER_INNER})..."
   ping -c 5 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 3
   echo
-  echo "Services for ports [${PORTS}] on this server must listen on 0.0.0.0 or ${IP_KHAREJ}."
-  echo "Traffic arrives from ${IP_IRAN} (the Iran server's tunnel IP)."
+  if [[ $ENGINE == rathole ]]; then
+    info "Waiting for the rathole reverse tunnel (${IP_KHAREJ} -> ${IP_IRAN}:${RH_PORT})..."
+    for _ in $(seq 1 12); do
+      (( $(rh_conn_count) >= 1 )) && break
+      sleep 1
+    done
+    if (( $(rh_conn_count) >= 1 )); then
+      ok "Reverse tunnel is connected."
+    else
+      warn "Not connected yet. Is the Iran side installed and running? See: journalctl -u ${RH_UNIT} -n 30 --no-pager"
+    fi
+    echo "Ports [${PORTS}] (${FWD_PROTO}) opened on the Iran server are forwarded to ${RH_TARGET}:<same port> on THIS server."
+    echo "The services must be running here and listening on ${RH_TARGET} (or 0.0.0.0)."
+  else
+    echo "Services for ports [${PORTS}] on this server must listen on 0.0.0.0 or ${IP_KHAREJ}."
+    echo "Traffic arrives from ${IP_IRAN} (the Iran server's tunnel IP)."
+  fi
   echo "Open the ESP protocol (IP proto 50$( [[ $MODE == udp ]] && echo ", UDP ${UDP_PORT}" )) in your provider's external firewall if it has one."
   echo
   pause
 }
 
 cmd_status() {
-  local st epoch left line
+  local st epoch left line st_rh
   if ! load_config 2>/dev/null; then
     warn "Tunnel is not installed. Use menu option 1 (Iran) or 2 (Kharej)."
     return
@@ -972,6 +1338,16 @@ cmd_status() {
   echo "Cipher        : AES-256-GCM, MTU $MTU, next key rotation in $((left / 60)) min (epoch $epoch)"
   echo "Watchdog      : rx-stall trigger ${RX_STALL_SEC}s, preventive rebuild $( (( FORCE_REBUILD_SEC > 0 )) && echo "every $((FORCE_REBUILD_SEC/3600))h" || echo disabled)"
   if [[ $st == active ]]; then echo "Service       : ${C_G}active${C_0}"; else echo "Service       : ${C_R}${st}${C_0}"; fi
+  if [[ $ENGINE == rathole ]]; then
+    st_rh=$(systemctl is-active "$RH_UNIT" 2>/dev/null)
+    if [[ $st_rh == active ]]; then
+      echo "Rathole       : ${C_G}active${C_0} ($( [[ $ROLE == iran ]] && echo server || echo client ), core v$(rh_version), control ${IP_IRAN}:${RH_PORT}, live connections: $(rh_conn_count))"
+    else
+      echo "Rathole       : ${C_R}${st_rh}${C_0}"
+    fi
+  else
+    echo "Forwarding    : iptables DNAT (legacy engine - re-install to switch to rathole)"
+  fi
 
   if ip link show "$IF_NAME" >/dev/null 2>&1; then
     echo "Interface     : $(ip -br addr show "$IF_NAME" | awk '{print $1, $2, $3}')"
@@ -992,7 +1368,15 @@ cmd_status() {
   else
     echo "XFRM counters : clean (no errors)"
   fi
-  if [[ $ROLE == iran ]]; then
+  if [[ $ENGINE == rathole ]]; then
+    echo
+    echo "--- Forwarded ports (${FWD_PROTO}) : [${PORTS}] ---"
+    if [[ $ROLE == iran ]]; then
+      echo "Public ports listening: $(rh_listen_summary)   (a port opens only while the Kharej client is connected)"
+    else
+      echo "Target on this server : ${RH_TARGET}"
+    fi
+  elif [[ $ROLE == iran ]]; then
     echo
     echo "--- Forwarded ports (${FWD_PROTO}) : [${PORTS}] -> ${IP_KHAREJ} ---"
     iptables -t nat -vnL ESPT_PRE 2>/dev/null | sed -n '2,$p'
@@ -1021,7 +1405,7 @@ live_counters() {
 }
 
 health_check() {
-  local out loss line x
+  local out loss line x rhc=0 rh_note=""
   echo "Running health check (~3s of pings)..."
   out=$(ping -c 10 -i 0.3 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1)
   echo "$out" | tail -n 3
@@ -1031,13 +1415,24 @@ health_check() {
   x=$(xfrm_nonzero_counters)
   echo "XFRM errors  : ${x:-none (clean)}"
   echo "SAs loaded   : $(wc -l < "$REG" 2>/dev/null || echo 0) (expect 4: 1 outbound + 3 inbound)"
+  if [[ $ENGINE == rathole ]]; then
+    rhc=$(rh_conn_count)
+    echo "Rathole      : service $(systemctl is-active "$RH_UNIT" 2>/dev/null), connections on ${IP_IRAN}:${RH_PORT}: ${rhc}"
+    if ! systemctl is-active --quiet "$RH_UNIT" 2>/dev/null || (( rhc == 0 )); then
+      rh_note=" - but the rathole reverse tunnel is NOT connected"
+    fi
+  fi
   echo
   if [[ -z $loss ]]; then
     echo "${C_R}Verdict: could not measure (ping did not run)${C_0}"
   elif (( loss == 0 )) && [[ -z $x ]]; then
-    echo "${C_G}Verdict: healthy (0% loss, no xfrm errors)${C_0}"
+    if [[ -n $rh_note ]]; then
+      echo "${C_Y}Verdict: ESP link healthy (0% loss, no xfrm errors)${rh_note}${C_0}"
+    else
+      echo "${C_G}Verdict: healthy (0% loss, no xfrm errors)${C_0}"
+    fi
   elif (( loss < 50 )); then
-    echo "${C_Y}Verdict: degraded (${loss}% loss)${C_0}"
+    echo "${C_Y}Verdict: degraded (${loss}% loss)${rh_note}${C_0}"
   else
     echo "${C_R}Verdict: down / severely degraded (${loss}% loss)${C_0}"
   fi
@@ -1052,39 +1447,76 @@ live_log() {
   echo "  2) Live ping monitor (packet loss + latency/jitter through the tunnel)"
   echo "  3) Live traffic counters (kbit/s, pps, errors)"
   echo "  4) Run health check now"
+  echo "  5) Rathole log (reverse tunnel)"
   read -r -p "Select [1]: " c
   case ${c:-1} in
     1) echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$APP" -f -n 40 --no-pager; trap - INT ;;
     2) echo "(Ctrl+C to stop and see the summary)"; trap ':' INT; ping -O -i 0.5 -I "$IF_NAME" "$PEER_INNER"; trap - INT ;;
     3) live_counters ;;
     4) health_check; pause ;;
+    5) if [[ $ENGINE == rathole ]]; then
+         echo "(Ctrl+C to return)"; trap ':' INT; journalctl -u "$RH_UNIT" -f -n 40 --no-pager; trap - INT
+       else
+         warn "This install does not use rathole."
+       fi ;;
     *) warn "Invalid choice." ;;
   esac
 }
 
 uninstall_all() {
-  confirm "Remove the tunnel completely (service, interface, keys, firewall rules)?" n || return
+  confirm "Remove the tunnel completely (services, rathole core, interface, keys, firewall rules)?" n || return
+  systemctl disable --now "$RH_UNIT" >/dev/null 2>&1
   systemctl disable --now "$APP" >/dev/null 2>&1
   teardown_all
-  rm -f "$UNIT_FILE" "$SYSCTL_FILE"
-  rm -rf "$CONF_DIR" "$RUN_DIR"
+  rm -f "$UNIT_FILE" "$RH_UNIT_FILE" "$SYSCTL_FILE"
+  rm -rf "$CONF_DIR" "$RUN_DIR" "$LIB_DIR"
   systemctl daemon-reload
-  systemctl reset-failed "$APP" 2>/dev/null
+  systemctl reset-failed "$APP" "$RH_UNIT" 2>/dev/null
   rm -f "$BIN"
   ok "Tunnel fully removed (net.ipv4.ip_forward was left unchanged)."
 }
 
 change_ports() {
+  local tok
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
-  if [[ $ROLE != iran ]]; then warn "Ports are configured on the Iran server only."; return; fi
-  info "Current ports: [${PORTS}] (${FWD_PROTO})"
-  ask_ports
-  ask_fwd_proto
-  write_config
-  if systemctl is-active --quiet "$APP"; then
-    "$BIN" fw && ok "New ports are active."
+
+  if [[ $ENGINE != rathole ]]; then      # legacy iptables engine
+    if [[ $ROLE != iran ]]; then warn "Ports are configured on the Iran server only."; return; fi
+    info "Current ports: [${PORTS}] (${FWD_PROTO})"
+    ask_ports
+    ask_fwd_proto
+    write_config
+    if systemctl is-active --quiet "$APP"; then
+      "$BIN" fw && ok "New ports are active."
+    fi
+    warn "The token changed (ports are part of it) - the Kharej side does not need to be updated."
+    return
   fi
-  warn "The token changed (ports are part of it) - the Kharej side does not need to be updated."
+
+  if [[ $ROLE == iran ]]; then
+    info "Current ports: [${PORTS}] (${FWD_PROTO})"
+    ask_ports
+    ask_fwd_proto
+    write_config
+    rh_write_config || return
+    systemctl restart "$RH_UNIT" && ok "Rathole restarted with the new port list."
+    warn "The port list is part of the token. Run this option (6) on the Kharej server and paste the new token below - both rathole sides need the same list."
+    print_token
+  else
+    info "Current ports (from the Iran token): [${PORTS}] (${FWD_PROTO}), target ${RH_TARGET}"
+    echo "Paste the updated token from the Iran server to sync the port list,"
+    echo "or press Enter to keep the ports and only change the target address."
+    read -r -p "Token: " tok
+    if [[ -n $tok ]]; then
+      parse_token "$tok" || { err "Invalid token."; return; }
+      [[ $T_MASTER == "$MASTER" ]] || { err "That token belongs to a different tunnel (key mismatch)."; return; }
+      PORTS=$(norm_ports "$T_PORTS"); FWD_PROTO=$T_PROTO
+    fi
+    ask_rh_target
+    write_config
+    rh_write_config || return
+    systemctl restart "$RH_UNIT" && ok "Rathole client restarted."
+  fi
 }
 
 show_token() {
@@ -1095,7 +1527,18 @@ show_token() {
 
 restart_tunnel() {
   load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
-  systemctl restart "$APP" && ok "Restarted."
+  systemctl restart "$APP" && ok "Tunnel restarted."
+  if [[ $ENGINE == rathole ]]; then
+    systemctl restart "$RH_UNIT" && ok "Rathole restarted."
+  fi
+}
+
+update_rathole() {
+  load_config 2>/dev/null || { warn "Tunnel is not installed."; return; }
+  if [[ $ENGINE != rathole ]]; then warn "This install does not use rathole (legacy DNAT engine) - re-install to switch."; return; fi
+  ensure_deps || return
+  ensure_rathole force || return
+  systemctl restart "$RH_UNIT" && ok "Rathole restarted with core v$(rh_version)."
 }
 
 change_watchdog() {
@@ -1118,11 +1561,11 @@ change_watchdog() {
 banner() {
   [[ -t 1 ]] && clear
   echo "${C_B}==============================================================${C_0}"
-  echo "${C_B}   ESP Tunnel Manager v${VERSION}  -  IP protocol 50 (ESP)${C_0}"
+  echo "${C_B}   ESP Tunnel Manager v${VERSION}  -  ESP + Rathole reverse tunnel${C_0}"
   echo "${C_B}   Iran ${IP_IRAN}  <=======  ESP  =======>  Kharej ${IP_KHAREJ}${C_0}"
   echo "${C_B}==============================================================${C_0}"
   if load_config 2>/dev/null; then
-    echo " Installed role: $ROLE   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
+    echo " Installed role: $ROLE   |   engine: $ENGINE   |   service: $(systemctl is-active "$APP" 2>/dev/null)"
   else
     echo " Not installed yet."
   fi
@@ -1133,16 +1576,17 @@ menu() {
   local ch
   while true; do
     banner
-    echo "  1) Tunnel Set Iran Server"
-    echo "  2) Tunnel Set Client (Kharej)"
+    echo "  1) Tunnel Set Iran Server  (rathole server)"
+    echo "  2) Tunnel Set Client (Kharej)  (rathole client)"
     echo "  3) Status Tunnel"
     echo "  4) Live Log"
     echo "  5) Uninstall Full Tunnel"
     echo "  ------------------------------------"
-    echo "  6) Change forwarded ports (Iran)"
+    echo "  6) Change forwarded ports (Iran) / sync ports + target (Kharej)"
     echo "  7) Restart tunnel"
     echo "  8) Show token (Iran)"
     echo "  9) Watchdog / preventive-rebuild settings"
+    echo " 10) Update rathole core"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch || exit 0
@@ -1157,6 +1601,7 @@ menu() {
       7) restart_tunnel; echo; pause ;;
       8) show_token; echo; pause ;;
       9) change_watchdog; echo; pause ;;
+      10) update_rathole; echo; pause ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice."; sleep 1 ;;
     esac
@@ -1164,7 +1609,7 @@ menu() {
 }
 
 usage() {
-  echo "Usage: $0 [menu|status|daemon|teardown|fw]"
+  echo "Usage: $0 [menu|status|daemon|teardown|fw|rh-run]"
 }
 
 main() {
@@ -1172,6 +1617,7 @@ main() {
     menu)     need_root; menu ;;
     status)   need_root; cmd_status ;;
     daemon)   need_root; cmd_daemon ;;
+    rh-run)   need_root; cmd_rh_run ;;
     teardown) need_root; cmd_teardown ;;
     fw)       need_root; cmd_fw ;;
     *)        usage; exit 1 ;;
