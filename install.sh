@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  ESP Tunnel Manager v1.4
+#  ESP Tunnel Manager v1.4.1
 #   * Optional clock-synchronized UDP port hopping (new outer-flow identity every 10 min)
 #   * Clock-aligned "quiet windows" in outage mode (lets stale NAT / ISP flow state expire)
 #   * Backoff watchdog (no more full-rebuild storms) + evidence lines in the journal
 #   * `diag` command: shows exactly where packets die
 #   * Tunnel's own outer UDP flow is excluded from DNAT + stale conntrack entries flushed
-#  Key/SPI derivation is identical to v1.3, so v1.3 <-> v1.4 peers interoperate
+#   * v1.4.1: dependency install no longer hides apt/dnf/yum errors; required deps are
+#     re-checked after install and setup now fails loudly (with the real reason) instead
+#     of silently continuing if something didn't actually get installed. New `deps` command.
+#  Key/SPI derivation is identical to v1.3, so v1.3 <-> v1.4.x peers interoperate
 #  as long as port hopping is off.
 # ==============================================================================
 
 APP="esp-tunnel"
-VERSION="1.4"
+VERSION="1.4.1"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
@@ -235,8 +238,8 @@ write_config() {
 }
 
 ensure_deps() {
-  local c pm=""
-  local -a missing=() pkgs=()
+  local c pm="" out
+  local -a missing=() pkgs=() still=()
   have systemctl || { err "systemd is required."; return 1; }
   for c in ip iptables ping ss sha256sum sha512sum base64 awk od head python3; do
     have "$c" || missing+=("$c")
@@ -247,7 +250,7 @@ ensure_deps() {
   elif have dnf;     then pm=dnf
   elif have yum;     then pm=yum
   fi
-  [[ -n $pm ]] || { err "Missing: ${missing[*]}"; return 1; }
+  [[ -n $pm ]] || { err "Missing: ${missing[*]} (no apt/dnf/yum found to auto-install)"; return 1; }
 
   for c in "${missing[@]}"; do
     case $c in
@@ -259,18 +262,28 @@ ensure_deps() {
   done
   info "Installing dependencies: ${pkgs[*]}"
   if [[ $pm == apt ]]; then
-    DEBIAN_FRONTEND=noninteractive timeout 240 apt-get update -qq >/dev/null 2>&1
-    DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1
+    out=$(DEBIAN_FRONTEND=noninteractive timeout 240 apt-get update -qq 2>&1) \
+      || warn "apt-get update failed: $(tr '\n' ' ' <<<"$out" | cut -c1-400)"
+    out=$(DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq "${pkgs[@]}" 2>&1) \
+      || err "apt-get install failed: $(tr '\n' ' ' <<<"$out" | cut -c1-400)"
   else
-    timeout 300 "$pm" install -y "${pkgs[@]}" >/dev/null 2>&1
+    out=$(timeout 300 "$pm" install -y "${pkgs[@]}" 2>&1) \
+      || err "$pm install failed: $(tr '\n' ' ' <<<"$out" | cut -c1-400)"
+  fi
+
+  for c in "${missing[@]}"; do have "$c" || still+=("$c"); done
+  if (( ${#still[@]} > 0 )); then
+    err "still missing after install attempt: ${still[*]}"
+    err "fix apt/network access on this server (see the error above - common causes: no internet/DNS from this VPS, wrong or unreachable mirror in /etc/apt/sources.list, or a filtered connection), then re-run"
+    return 1
   fi
   return 0
 }
 
 # Optional tools (never fatal): conntrack = flush stale outer-flow entries, tcpdump = `diag` wire capture.
 ensure_opt_deps() {
-  local pm=""
-  local -a pkgs=()
+  local pm="" out
+  local -a pkgs=() still=()
   have conntrack || pkgs+=(conntrack)
   have tcpdump   || pkgs+=(tcpdump)
   (( ${#pkgs[@]} == 0 )) && return 0
@@ -278,15 +291,23 @@ ensure_opt_deps() {
   elif have dnf;     then pm=dnf
   elif have yum;     then pm=yum
   fi
-  [[ -n $pm ]] || return 0
+  if [[ -z $pm ]]; then
+    warn "no apt/dnf/yum found; install manually if you want them: ${pkgs[*]}"
+    return 0
+  fi
   [[ $pm != apt ]] && pkgs=("${pkgs[@]/conntrack/conntrack-tools}")
   info "Installing optional tools: ${pkgs[*]}"
   if [[ $pm == apt ]]; then
-    DEBIAN_FRONTEND=noninteractive timeout 120 apt-get update -qq >/dev/null 2>&1
-    DEBIAN_FRONTEND=noninteractive timeout 240 apt-get install -y -qq "${pkgs[@]}" >/dev/null 2>&1
+    out=$(DEBIAN_FRONTEND=noninteractive timeout 120 apt-get update -qq 2>&1) \
+      || warn "apt-get update failed: $(tr '\n' ' ' <<<"$out" | cut -c1-300)"
+    out=$(DEBIAN_FRONTEND=noninteractive timeout 240 apt-get install -y -qq "${pkgs[@]}" 2>&1) \
+      || warn "could not install ${pkgs[*]}: $(tr '\n' ' ' <<<"$out" | cut -c1-300)"
   else
-    timeout 240 "$pm" install -y "${pkgs[@]}" >/dev/null 2>&1
+    out=$(timeout 240 "$pm" install -y "${pkgs[@]}" 2>&1) \
+      || warn "could not install ${pkgs[*]}: $(tr '\n' ' ' <<<"$out" | cut -c1-300)"
   fi
+  for c in conntrack tcpdump; do have "$c" || still+=("$c"); done
+  (( ${#still[@]} > 0 )) && warn "still missing (optional, tunnel works without them): ${still[*]} - diag/auto-heal will just skip the parts that need them"
   return 0
 }
 
@@ -1161,9 +1182,17 @@ cmd_rebuild_every() {
   systemctl restart "$APP" && ok "Scheduled full rebuild every ${s}s (0 = off)."
 }
 
+cmd_deps() {
+  load_config 2>/dev/null
+  ensure_deps || return 1
+  ensure_opt_deps
+  ok "Dependency check done."
+}
+
 cmd_upgrade() {
   load_config || { err "Not installed - use the menu to set up first."; return 1; }
   install_self || { err "Run this from the script file itself (not through a pipe)."; return 1; }
+  ensure_deps || { err "required dependencies are missing - fix that first (see errors above), then re-run upgrade."; return 1; }
   ensure_opt_deps
   start_service
 }
@@ -1223,7 +1252,8 @@ main() {
     rebuild-every) need_root; cmd_rebuild_every "${2:-}" ;;
     rebuild)       need_root; systemctl restart "$APP" && ok "Rebuilt (config unchanged)." ;;
     upgrade|install) need_root; cmd_upgrade ;;
-    *) echo "usage: $0 {menu|status|diag|port N|hop on|off|rebuild|rebuild-every SEC|upgrade}"; exit 1 ;;
+    deps)          need_root; cmd_deps ;;
+    *) echo "usage: $0 {menu|status|diag|port N|hop on|off|rebuild|rebuild-every SEC|upgrade|deps}"; exit 1 ;;
   esac
 }
 
