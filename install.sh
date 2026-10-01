@@ -1,26 +1,59 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  ESP Tunnel Manager v1.5 - Stability Edition (No-Drop Watchdog & Fast Path)
-#  - Watchdog rebuilt: no more full teardowns on single lost/slow pings
-#  - Probe-based peer detection with adaptive timeout (RTT-aware)
-#  - Rebuild cooldown + jitter (prevents both ends flapping together)
-#  - Idempotent policy/firewall heal (no drop windows during soft-heal)
-#  - Graceful hourly key rotation (extended in-key window, logged failures)
-#  - BBR + fq + kernel buffer tuning for lower latency/loss on forwarded TCP
+#  ESP Tunnel Manager v1.6 - Zero-Drop Edition
+#
+#  Wire-compatible with v1.5 (same keys / SPIs / UDP port / inner IPs), so you
+#  can upgrade one server at a time without a key mismatch.
+#
+#  Root causes fixed compared with v1.5
+#  -----------------------------------------------------------------------------
+#   1. Silent "tunnel up but ports dead": soft-heal never re-applied iptables.
+#      If ufw / docker / fail2ban / netfilter-persistent flushed or re-ordered
+#      the ESPT_* chains, DNAT/SNAT/ACCEPT were gone while ping still worked.
+#      -> firewall drift is now detected (signature) and healed atomically.
+#   2. policies_ensure() grepped "if_id 42" but iproute2 prints "if_id 0x2a":
+#      the check never matched, so every soft-heal DELETED and re-added the XFRM
+#      policies (a real drop window). -> hex/dec aware, per-policy, atomic update.
+#   3. SA registry (/run/.../sa.list) could disagree with the kernel; a missing
+#      SA was never re-created by soft-heal. -> SAs are verified against the
+#      kernel every tick; stale/conflicting SAs are removed after new ones are in.
+#   4. fw_sync compared `iptables -S` text with hand-written rules (-d x vs
+#      -d x/32, option order) so it always "differed" and flushed the chain.
+#      -> atomic iptables-restore of each table (no empty-chain window).
+#   5. conntrack established timeout was 7200s: idle long-lived TCP flows
+#      (xray/v2ray, ssh, websockets) were cut every ~2h.  -> 86400s,
+#      + tcp_be_liberal, larger UDP timeouts, bigger hash table.
+#   6. Full rebuild on 30s of ping loss.  The ISP link flaps often; a rebuild
+#      cannot fix the ISP but it does reset flows.  -> the daemon only repairs
+#      what is actually broken; a full rebuild is a last resort after 10 min.
+#   7. Restart/teardown on every crash (ExecStopPost).  -> teardown only on a
+#      real `systemctl stop`; after a crash the daemon adopts the live state.
+#   8. Outer ESP/UDP flow went through conntrack (CPU + table pressure).
+#      -> optional NOTRACK for the outer flow only.
+#   9. Wider key window (e-3..e+3), clock-sync guard (keys are time based).
+#  10. Legacy cron/timer "healthcheck" watchers that restart the service are
+#      detected and can be removed.
+#  11. MTU 1360 was needlessly low for UDP on some links and too high on others;
+#      default 1380 (safe on >=1450 underlays) + built-in path-MTU tester and
+#      an editable MTU override (no restart needed).
+#  12. Better diagnostics: when the peer is silent the log tells you WHY
+#      (SPI mismatch / decrypt errors / nothing arriving).
 # ==============================================================================
 
+export LC_ALL=C
+
 APP="esp-tunnel"
-VERSION="1.5"
+VERSION="1.6"
 BIN="/usr/local/bin/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF="${CONF_DIR}/config"
 UNIT_FILE="/etc/systemd/system/${APP}.service"
 SYSCTL_FILE="/etc/sysctl.d/99-${APP}.conf"
 RUN_DIR="/run/${APP}"
-REG="${RUN_DIR}/sa.list"
 UDP_PID_FILE="${RUN_DIR}/udp.pid"
+UDP_ERR_FILE="${RUN_DIR}/udp.err"
 
-# ---- توکن و تنظیمات پیش‌فرض ثابت (Shared Static Secret) ----
+# ---- Shared static secret / defaults (MUST stay identical on both servers) ----
 STATIC_MASTER="e7d8f3c1a4b92850d6e1749c3b8a1052f9c4e7b8a1d2e3f4c5b6a78901234567"
 DEFAULT_UDP_PORT=39540
 DEFAULT_MODE="udp"
@@ -28,28 +61,62 @@ DEFAULT_PORTS="443,80,2053,2083,2087,2096,8443"
 
 IF_NAME="espt0"
 IF_ID=42
+IF_HEX=$(printf '%x' "$IF_ID")
 IP_IRAN="10.10.10.2"
 IP_KHAREJ="10.10.10.1"
 NET_PREFIX=30
-EPOCH_LEN=3600
-MTU_ESP=1400
-MTU_UDP=1360
-DEFAULT_FORCE_REBUILD_SEC=0       # 0 = disabled (soft-rotate handles it safely)
-DEFAULT_RX_STALL_SEC=180          # deprecated in v1.5 (probe-based watchdog)
+EPOCH_LEN=3600            # key-derivation input: never change (must match peer)
+IN_BACK=3                 # accept peer keys from epoch e-3 ...
+IN_FWD=3                  # ... to e+3  (clock skew / rotation lag tolerance)
+MTU_ESP=1400              # raw ESP  : worst-case overhead 57  -> fits underlay >= 1457
+MTU_UDP=1380              # ESP/UDP  : worst-case overhead 65  -> fits underlay >= 1445
 
-# ---- v1.5 watchdog tuning ----
-MAX_FAILS=6                       # consecutive failed probes before acting (~30s)
-MIN_REBUILD_GAP=120               # min seconds between full rebuilds (cooldown)
-HEAL_TRIES=3                      # soft-heal attempts before full rebuild
-PROBE_W=2                         # per-ping timeout (adaptive: 2xRTT + 2, clamped 2..10)
+# ---- watchdog tuning ----
+TICK=5                    # seconds between reconcile + probe cycles
+FAIL_WARN=3               # consecutive failed probes before logging "peer silent"
+DOWN_REBUILD_SEC=600      # last-resort full rebuild after this long without peer
+REBUILD_COOLDOWN=900      # min seconds between full rebuilds
+FW_EVERY=3                # verify firewall every N ticks (~15s)
+PROBE_W=3                 # per-ping timeout (adapted to measured RTT)
 
 ROLE=""; MASTER="$STATIC_MASTER"; IRAN_IP=""; KHAREJ_IP=""; MODE="$DEFAULT_MODE"; UDP_PORT="$DEFAULT_UDP_PORT"
-PORTS=""; FWD_PROTO="both"
+PORTS=""; FWD_PROTO="both"; MTU_OVERRIDE=""; NOTRACK=1
 LOCAL_INNER=""; PEER_INNER=""; PEER_PUB=""; OUT_LABEL=""; IN_LABEL=""; MTU="$MTU_UDP"
-LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0
-FORCE_REBUILD_SEC="$DEFAULT_FORCE_REBUILD_SEC"; RX_STALL_SEC="$DEFAULT_RX_STALL_SEC"
+LOCAL_ADDR=""; WAN_DEV=""; CUR_EPOCH=0; NOW=0
+LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"; DOWN_SINCE=0; RELOAD=0
+POL_SIG=""; FW_SIG=""; POL_FAIL_TS=0
+D_SRC=""; D_DST=""; D_SPI=""; D_KEY=""
 
-LAST_REBUILD=0; FAILS=0; PEER_STATE="unknown"
+declare -A SPI_C=() KEY_C=() LOG_LAST=() XS_PREV=()
+FW_SPECS=()
+
+FW_ALL=("filter ESPT_IN INPUT" "filter ESPT_FWD FORWARD" "mangle ESPT_MSS POSTROUTING"
+        "nat ESPT_PRE PREROUTING" "nat ESPT_POST POSTROUTING"
+        "raw ESPT_RAWP PREROUTING" "raw ESPT_RAWO OUTPUT")
+
+SYSCTL_LIST=(
+  "net.ipv4.ip_forward=1"
+  "net.ipv4.conf.all.rp_filter=0"
+  "net.ipv4.conf.default.rp_filter=0"
+  "net.ipv4.conf.lo.rp_filter=0"
+  "net.netfilter.nf_conntrack_max=1048576"
+  "net.netfilter.nf_conntrack_tcp_timeout_established=86400"
+  "net.netfilter.nf_conntrack_tcp_be_liberal=1"
+  "net.netfilter.nf_conntrack_udp_timeout=60"
+  "net.netfilter.nf_conntrack_udp_timeout_stream=300"
+  "net.core.rmem_max=33554432"
+  "net.core.wmem_max=33554432"
+  "net.core.netdev_max_backlog=250000"
+  "net.core.netdev_budget=600"
+  "net.core.default_qdisc=fq"
+  "net.ipv4.tcp_congestion_control=bbr"
+  "net.ipv4.tcp_rmem=4096 131072 33554432"
+  "net.ipv4.tcp_wmem=4096 65536 33554432"
+  "net.ipv4.tcp_mtu_probing=1"
+  "net.ipv4.tcp_slow_start_after_idle=0"
+)
+
+LEGACY_RE='esp-tunnel-health|systemctl[[:space:]]+(re)?start[[:space:]]+esp-tunnel|service[[:space:]]+esp-tunnel[[:space:]]+(re)?start'
 
 PY_UDP='
 import socket, sys, time
@@ -61,7 +128,7 @@ try:
 except Exception:
     pass
 s.bind(("0.0.0.0", port))
-s.setsockopt(socket.IPPROTO_UDP, 100, 2)   # UDP_ENCAP_ESPINUDP
+s.setsockopt(socket.IPPROTO_UDP, 100, 2)   # UDP_ENCAP = UDP_ENCAP_ESPINUDP
 while True:
     try:
         s.recvfrom(65535)
@@ -69,6 +136,9 @@ while True:
         time.sleep(0.2)
 '
 
+# ------------------------------------------------------------------------------
+#  Basic helpers
+# ------------------------------------------------------------------------------
 if [[ -t 1 ]]; then
   C_R=$'\e[1;31m'; C_G=$'\e[1;32m'; C_Y=$'\e[1;33m'; C_B=$'\e[1;36m'; C_0=$'\e[0m'
 else
@@ -80,6 +150,21 @@ warn() { echo "${C_Y}[!]${C_0} $*" >&2; }
 err()  { echo "${C_R}[x]${C_0} $*" >&2; }
 log()  { echo "[${APP}] $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+if printf -v _t '%(%s)T' -1 2>/dev/null; then
+  now_s() { printf -v NOW '%(%s)T' -1; }
+else
+  now_s() { NOW=$(date +%s); }
+fi
+
+# log at most once per 60s per key (keeps the journal readable in a flap loop)
+rlog() {
+  local k=$1; shift
+  now_s
+  (( NOW - ${LOG_LAST[$k]:-0} >= 60 )) || return 0
+  LOG_LAST[$k]=$NOW
+  log "$*"
+}
 
 need_root() {
   if [[ $EUID -ne 0 ]]; then
@@ -152,14 +237,16 @@ ssh_ports() {
   echo "$p ${SSH_CONNECTION##* }"
 }
 
-kdf() { printf '%s' "$1" | sha512sum | awk '{print $1}'; }
+kdf() { local o; o=$(printf '%s' "$1" | sha512sum); printf '%s' "${o%% *}"; }
 
 route_info() {
-  local out
+  local out a d
   out=$(ip -4 route get "$1" 2>/dev/null | head -n1)
-  LOCAL_ADDR=$(awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}' <<<"$out")
-  WAN_DEV=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$out")
-  [[ -n $LOCAL_ADDR && -n $WAN_DEV ]]
+  a=$(awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}' <<<"$out")
+  d=$(awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$out")
+  [[ -n $a && -n $d ]] || return 1       # keep last good values on failure
+  LOCAL_ADDR=$a; WAN_DEV=$d
+  return 0
 }
 
 detect_public_ip() {
@@ -174,21 +261,33 @@ detect_public_ip() {
   echo "$addr"
 }
 
+xfrm_stat() { awk -v k="$1" '$1==k{print $2; exit}' /proc/net/xfrm_stat 2>/dev/null; }
+
+# ------------------------------------------------------------------------------
+#  Config
+# ------------------------------------------------------------------------------
 load_config() {
   [[ -r $CONF ]] || return 1
+  MTU_OVERRIDE=""; NOTRACK=""
   # shellcheck disable=SC1090
   source "$CONF"
   MASTER=${MASTER:-$STATIC_MASTER}
   MODE=${MODE:-$DEFAULT_MODE}; UDP_PORT=${UDP_PORT:-$DEFAULT_UDP_PORT}; FWD_PROTO=${FWD_PROTO:-both}
-  FORCE_REBUILD_SEC=${FORCE_REBUILD_SEC:-$DEFAULT_FORCE_REBUILD_SEC}
-  RX_STALL_SEC=${RX_STALL_SEC:-$DEFAULT_RX_STALL_SEC}
+  NOTRACK=${NOTRACK:-1}
   case $ROLE in
     iran)   LOCAL_INNER=$IP_IRAN;   PEER_INNER=$IP_KHAREJ; PEER_PUB=$KHAREJ_IP; OUT_LABEL=i2k; IN_LABEL=k2i ;;
     kharej) LOCAL_INNER=$IP_KHAREJ; PEER_INNER=$IP_IRAN;   PEER_PUB=$IRAN_IP;   OUT_LABEL=k2i; IN_LABEL=i2k ;;
     *) return 1 ;;
   esac
   [[ -n $MASTER && -n $PEER_PUB ]] || return 1
-  if [[ $MODE == udp ]]; then MTU=$MTU_UDP; else MTU=$MTU_ESP; fi
+  if [[ $MTU_OVERRIDE =~ ^[0-9]+$ ]] && (( 10#$MTU_OVERRIDE >= 1200 && 10#$MTU_OVERRIDE <= 1500 )); then
+    MTU=$((10#$MTU_OVERRIDE))
+  elif [[ $MODE == udp ]]; then
+    MTU=$MTU_UDP
+  else
+    MTU=$MTU_ESP
+  fi
+  SPI_C=(); KEY_C=()
   return 0
 }
 
@@ -198,26 +297,37 @@ write_config() {
     umask 077
     {
       echo "# ${APP} config"
-      printf 'ROLE=%q\n'      "$ROLE"
-      printf 'MASTER=%q\n'    "$MASTER"
-      printf 'IRAN_IP=%q\n'   "$IRAN_IP"
-      printf 'KHAREJ_IP=%q\n' "$KHAREJ_IP"
-      printf 'MODE=%q\n'      "$MODE"
-      printf 'UDP_PORT=%q\n'  "$UDP_PORT"
-      printf 'PORTS=%q\n'     "$PORTS"
-      printf 'FWD_PROTO=%q\n' "$FWD_PROTO"
-      printf 'FORCE_REBUILD_SEC=%q\n' "$FORCE_REBUILD_SEC"
-      printf 'RX_STALL_SEC=%q\n'      "$RX_STALL_SEC"
+      printf 'ROLE=%q\n'         "$ROLE"
+      printf 'MASTER=%q\n'       "$MASTER"
+      printf 'IRAN_IP=%q\n'      "$IRAN_IP"
+      printf 'KHAREJ_IP=%q\n'    "$KHAREJ_IP"
+      printf 'MODE=%q\n'         "$MODE"
+      printf 'UDP_PORT=%q\n'     "$UDP_PORT"
+      printf 'PORTS=%q\n'        "$PORTS"
+      printf 'FWD_PROTO=%q\n'    "$FWD_PROTO"
+      printf 'MTU_OVERRIDE=%q\n' "$MTU_OVERRIDE"
+      printf 'NOTRACK=%q\n'      "$NOTRACK"
     } > "$CONF"
   )
   chmod 600 "$CONF"
 }
 
+reload_daemon() {
+  if systemctl is-active --quiet "$APP"; then
+    systemctl kill -s HUP --kill-whom=main "$APP" 2>/dev/null \
+      && ok "Settings applied live (no restart, no downtime)." \
+      || warn "Could not signal the service; run: systemctl restart $APP"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+#  Dependencies / kernel / clock / legacy watchers
+# ------------------------------------------------------------------------------
 ensure_deps() {
   local c pm=""
   local -a missing=() pkgs=()
   have systemctl || { err "systemd is required."; return 1; }
-  for c in ip iptables ping ss sha256sum sha512sum base64 awk od head python3; do
+  for c in ip iptables iptables-restore ping ss sha512sum awk python3 cksum sed grep; do
     have "$c" || missing+=("$c")
   done
   (( ${#missing[@]} == 0 )) && return 0
@@ -230,10 +340,14 @@ ensure_deps() {
 
   for c in "${missing[@]}"; do
     case $c in
-      ip|ss)   [[ $pm == apt ]] && pkgs+=(iproute2) || pkgs+=(iproute) ;;
-      ping)    [[ $pm == apt ]] && pkgs+=(iputils-ping) || pkgs+=(iputils) ;;
-      iptables|python3) pkgs+=("$c") ;;
-      *)       pkgs+=(coreutils) ;;
+      ip|ss)                    [[ $pm == apt ]] && pkgs+=(iproute2) || pkgs+=(iproute) ;;
+      ping)                     [[ $pm == apt ]] && pkgs+=(iputils-ping) || pkgs+=(iputils) ;;
+      iptables|iptables-restore) pkgs+=(iptables) ;;
+      python3)                  pkgs+=(python3) ;;
+      awk)                      pkgs+=(gawk) ;;
+      sed)                      pkgs+=(sed) ;;
+      grep)                     pkgs+=(grep) ;;
+      *)                        pkgs+=(coreutils) ;;
     esac
   done
   info "Installing dependencies: ${pkgs[*]}"
@@ -243,12 +357,16 @@ ensure_deps() {
   else
     timeout 300 "$pm" install -y "${pkgs[@]}" >/dev/null 2>&1
   fi
+  for c in "${missing[@]}"; do
+    have "$c" || { err "Dependency still missing: $c"; return 1; }
+  done
   return 0
 }
 
 load_modules() {
   local m
-  for m in xfrm_interface xfrm_user esp4 gcm aesni_intel nf_conntrack xt_TCPMSS iptable_nat tcp_bbr; do
+  for m in xfrm_interface xfrm_user esp4 gcm aesni_intel nf_conntrack xt_conntrack xt_TCPMSS \
+           xt_CT iptable_nat iptable_raw tcp_bbr sch_fq; do
     modprobe -q "$m" 2>/dev/null
   done
   return 0
@@ -266,7 +384,125 @@ check_kernel() {
   return 0
 }
 
+time_synced() { timedatectl status 2>/dev/null | grep -qiE 'synchronized: *yes'; }
+
+# Keys are derived from the wall clock: both servers must agree on the hour.
+ensure_time_sync() {
+  have timedatectl || { warn "timedatectl not found: make sure both servers keep correct time (NTP)."; return 0; }
+  time_synced && return 0
+  warn "System clock is NOT NTP-synchronized (tunnel keys are time-based)."
+  timedatectl set-ntp true >/dev/null 2>&1
+  sleep 3
+  if time_synced; then ok "NTP synchronization enabled."; return 0; fi
+  warn "Still not synchronized. Check 'timedatectl status' and your NTP service on this server."
+  return 0
+}
+
+legacy_files()  { grep -lsE "$LEGACY_RE" /etc/crontab /etc/cron.d/* /var/spool/cron/crontabs/* /var/spool/cron/* 2>/dev/null; }
+legacy_units()  { systemctl list-unit-files --no-legend 2>/dev/null | awk '$1 ~ /^esp-tunnel-.+\.(timer|service)$/ {print $1}'; }
+legacy_found() {
+  [[ -n $(legacy_files) ]] && return 0
+  [[ -e /usr/local/bin/esp-tunnel-healthcheck.sh ]] && return 0
+  [[ -n $(legacy_units) ]] && return 0
+  return 1
+}
+
+# Old health-check cron jobs / timers restart the service behind the daemon's
+# back; every restart tears the tunnel down = periodic outage.
+legacy_clean() {
+  local f u bak="/root/${APP}-legacy-backup"
+  legacy_found || { ok "No legacy watchers found."; return 0; }
+  warn "Found external watchers that can restart the tunnel service:"
+  for f in $(legacy_files); do
+    echo "  $f"
+    grep -nE "$LEGACY_RE" "$f" | sed 's/^/      /'
+  done
+  [[ -e /usr/local/bin/esp-tunnel-healthcheck.sh ]] && echo "  /usr/local/bin/esp-tunnel-healthcheck.sh"
+  for u in $(legacy_units); do echo "  systemd unit: $u"; done
+  if [[ ! -t 0 ]]; then
+    warn "Non-interactive run: not removing automatically. Run: $BIN cleanup"
+    return 0
+  fi
+  confirm "Remove them now? (backups go to $bak)" y || return 0
+  mkdir -p "$bak"
+  for f in $(legacy_files); do
+    cp -a "$f" "$bak/$(tr '/' '_' <<<"$f")"
+    sed -i -E "/$LEGACY_RE/d" "$f"
+  done
+  rm -f /usr/local/bin/esp-tunnel-healthcheck.sh
+  for u in $(legacy_units); do
+    systemctl disable --now "$u" >/dev/null 2>&1
+    rm -f "/etc/systemd/system/$u"
+  done
+  systemctl daemon-reload
+  ok "Legacy watchers removed."
+}
+
+# ------------------------------------------------------------------------------
+#  Firewall (atomic, drift-aware)
+# ------------------------------------------------------------------------------
 ipt() { iptables -w 5 "$@"; }
+
+ipt_restore() {
+  local payload=$1
+  printf '%s\n' "$payload" | iptables-restore -w 5 --noflush 2>/dev/null && return 0
+  printf '%s\n' "$payload" | iptables-restore --noflush
+}
+
+raw_ok() { iptables -w 5 -t raw -S >/dev/null 2>&1; }
+
+fw_define() {
+  FW_SPECS=("filter ESPT_IN INPUT" "filter ESPT_FWD FORWARD" "mangle ESPT_MSS POSTROUTING")
+  if [[ $ROLE == iran ]]; then
+    FW_SPECS+=("nat ESPT_PRE PREROUTING" "nat ESPT_POST POSTROUTING")
+  fi
+  if (( NOTRACK )) && raw_ok; then
+    FW_SPECS+=("raw ESPT_RAWP PREROUTING" "raw ESPT_RAWO OUTPUT")
+  fi
+}
+
+fw_rules_of() {
+  local c=$1 spec d pr
+  local -a specs=() protos=()
+  case $c in
+    ESPT_IN)
+      echo "-A ESPT_IN -i $IF_NAME -j ACCEPT"
+      if [[ $MODE == udp ]]; then
+        echo "-A ESPT_IN -p udp -m udp --dport $UDP_PORT -j ACCEPT"
+      else
+        echo "-A ESPT_IN -p 50 -s $PEER_PUB -j ACCEPT"
+      fi ;;
+    ESPT_FWD)
+      echo "-A ESPT_FWD -i $IF_NAME -j ACCEPT"
+      echo "-A ESPT_FWD -o $IF_NAME -j ACCEPT" ;;
+    ESPT_MSS)
+      echo "-A ESPT_MSS -o $IF_NAME -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $(( MTU - 40 ))" ;;
+    ESPT_PRE)
+      case $FWD_PROTO in tcp) protos=(tcp) ;; udp) protos=(udp) ;; *) protos=(tcp udp) ;; esac
+      IFS=',' read -ra specs <<< "$PORTS"
+      for spec in "${specs[@]}"; do
+        [[ -z $spec ]] && continue
+        d=${spec/-/:}
+        for pr in "${protos[@]}"; do
+          echo "-A ESPT_PRE ! -i $IF_NAME -p $pr -m $pr --dport $d -j DNAT --to-destination $IP_KHAREJ"
+        done
+      done ;;
+    ESPT_POST)
+      echo "-A ESPT_POST -o $IF_NAME -d $IP_KHAREJ -j SNAT --to-source $IP_IRAN" ;;
+    ESPT_RAWP)
+      if [[ $MODE == udp ]]; then
+        echo "-A ESPT_RAWP -p udp -m udp --dport $UDP_PORT -j CT --notrack"
+      else
+        echo "-A ESPT_RAWP -p 50 -s $PEER_PUB -j CT --notrack"
+      fi ;;
+    ESPT_RAWO)
+      if [[ $MODE == udp ]]; then
+        echo "-A ESPT_RAWO -p udp -m udp --sport $UDP_PORT -j CT --notrack"
+      else
+        echo "-A ESPT_RAWO -p 50 -d $PEER_PUB -j CT --notrack"
+      fi ;;
+  esac
+}
 
 fw_chain_remove() {
   local t=$1 c=$2 h=$3
@@ -275,107 +511,126 @@ fw_chain_remove() {
   ipt -t "$t" -X "$c" 2>/dev/null
 }
 
-# v1.5: sync chain contents instead of flush+repopulate -> no drop window,
-# and no-op when rules are already correct (safe to run during heal).
-fw_sync() {
-  local t=$1 c=$2 h=$3; shift 3
-  local -a want=("$@") cur=()
-  local i same=1 r
-  ipt -t "$t" -N "$c" 2>/dev/null
-  while ipt -t "$t" -D "$h" -j "$c" 2>/dev/null; do :; done
-  ipt -t "$t" -I "$h" 1 -j "$c"
-  mapfile -t cur < <(iptables -t "$t" -S "$c" 2>/dev/null | tail -n +2)
-  if (( ${#cur[@]} == ${#want[@]} )); then
-    for i in "${!want[@]}"; do
-      [[ "${cur[$i]}" == "${want[$i]}" ]] || { same=0; break; }
-    done
-    (( same )) && return 0
+# Make sure exactly one `-j CHAIN` exists in HOOK and that it is rule #1.
+# The new jump is inserted BEFORE duplicates are removed (no unprotected moment).
+fw_hook_ensure() {
+  local t=$1 c=$2 h=$3 dump first cnt i
+  local -a nums=()
+  dump=$(iptables -w 5 -t "$t" -S "$h" 2>/dev/null) || return 1
+  first=$(sed -n 2p <<<"$dump")
+  cnt=$(grep -cxF -- "-A $h -j $c" <<<"$dump")
+  [[ $first == "-A $h -j $c" && $cnt -eq 1 ]] && return 0
+  if [[ $first != "-A $h -j $c" ]]; then
+    ipt -t "$t" -I "$h" 1 -j "$c" || return 1
   fi
-  ipt -t "$t" -F "$c"
-  for r in "${want[@]}"; do
-    # shellcheck disable=SC2086
-    ipt -t "$t" $r
+  mapfile -t nums < <(iptables -w 5 -t "$t" -L "$h" -n --line-numbers 2>/dev/null \
+                      | awk -v c="$c" 'NR>2 && $2==c && $3=="all" {print $1}')
+  for (( i=${#nums[@]}-1; i>=1; i-- )); do
+    ipt -t "$t" -D "$h" "${nums[i]}" 2>/dev/null
   done
-}
-
-fw_remove() {
-  have iptables || return 0
-  fw_chain_remove filter ESPT_IN   INPUT
-  fw_chain_remove filter ESPT_FWD  FORWARD
-  fw_chain_remove mangle ESPT_MSS  POSTROUTING
-  fw_chain_remove nat    ESPT_PRE  PREROUTING
-  fw_chain_remove nat    ESPT_POST POSTROUTING
-}
-
-fw_apply() {
-  local spec d pr
-  local -a specs=() protos=() rules=()
-
-  rules=("-A ESPT_IN -i $IF_NAME -j ACCEPT")
-  if [[ $MODE == udp ]]; then
-    rules+=("-A ESPT_IN -p udp -m udp --dport $UDP_PORT -j ACCEPT")
-  else
-    rules+=("-A ESPT_IN -p 50 -s $PEER_PUB -j ACCEPT")
-  fi
-  fw_sync filter ESPT_IN INPUT "${rules[@]}"
-
-  rules=("-A ESPT_FWD -i $IF_NAME -j ACCEPT" "-A ESPT_FWD -o $IF_NAME -j ACCEPT")
-  fw_sync filter ESPT_FWD FORWARD "${rules[@]}"
-
-  local target_mss=$(( MTU - 40 ))
-  rules=("-A ESPT_MSS -o $IF_NAME -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $target_mss")
-  fw_sync mangle ESPT_MSS POSTROUTING "${rules[@]}"
-
-  if [[ $ROLE == iran ]]; then
-    case $FWD_PROTO in
-      tcp) protos=(tcp) ;;
-      udp) protos=(udp) ;;
-      *)   protos=(tcp udp) ;;
-    esac
-    rules=()
-    IFS=',' read -ra specs <<< "$PORTS"
-    for spec in "${specs[@]}"; do
-      [[ -z $spec ]] && continue
-      d=${spec/-/:}
-      for pr in "${protos[@]}"; do
-        rules+=("-A ESPT_PRE ! -i $IF_NAME -p $pr -m $pr --dport $d -j DNAT --to-destination $IP_KHAREJ")
-      done
-    done
-    fw_sync nat ESPT_PRE PREROUTING "${rules[@]}"
-    rules=("-A ESPT_POST -o $IF_NAME -d $IP_KHAREJ -j SNAT --to-source $IP_IRAN")
-    fw_sync nat ESPT_POST POSTROUTING "${rules[@]}"
-  else
-    fw_chain_remove nat ESPT_PRE  PREROUTING
-    fw_chain_remove nat ESPT_POST POSTROUTING
-  fi
   return 0
 }
 
+# Signature of everything we own (chain contents + position of our jumps).
+fw_sig() {
+  local spec t c h s=""
+  for spec in "${FW_SPECS[@]}"; do
+    read -r t c h <<<"$spec"
+    s+=$(iptables -w 5 -t "$t" -S "$c" 2>&1)
+    s+=$(iptables -w 5 -t "$t" -S "$h" 2>&1 | sed -n 2p)
+  done
+  printf '%s' "$s" | cksum
+}
+
+fw_apply() {
+  local spec t st c h payload rules rc=0
+  local -A inset=()
+  fw_define
+  for spec in "${FW_SPECS[@]}"; do inset[$spec]=1; done
+
+  for t in filter mangle nat raw; do
+    payload=""
+    for spec in "${FW_SPECS[@]}"; do
+      read -r st c h <<<"$spec"
+      [[ $st == "$t" ]] || continue
+      rules=$(fw_rules_of "$c")
+      payload+=":$c - [0:0]"$'\n'"-F $c"$'\n'
+      [[ -n $rules ]] && payload+="$rules"$'\n'
+    done
+    [[ -n $payload ]] || continue
+    ipt_restore "*${t}"$'\n'"${payload}COMMIT" || { log "ERROR: iptables-restore failed (table $t)"; rc=1; }
+  done
+
+  for spec in "${FW_SPECS[@]}"; do
+    read -r t c h <<<"$spec"
+    fw_hook_ensure "$t" "$c" "$h" || rc=1
+  done
+
+  for spec in "${FW_ALL[@]}"; do
+    [[ -n ${inset[$spec]:-} ]] && continue
+    read -r t c h <<<"$spec"
+    fw_chain_remove "$t" "$c" "$h"
+  done
+  FW_SIG=$(fw_sig)
+  return $rc
+}
+
+fw_verify() {
+  [[ $(fw_sig) == "$FW_SIG" ]] && return 0
+  log "firewall drift detected (flushed/reordered by another tool) -> re-applying"
+  fw_apply
+}
+
+fw_remove() {
+  local spec t c h
+  have iptables || return 0
+  for spec in "${FW_ALL[@]}"; do
+    read -r t c h <<<"$spec"
+    fw_chain_remove "$t" "$c" "$h"
+  done
+}
+
+# ------------------------------------------------------------------------------
+#  sysctl
+# ------------------------------------------------------------------------------
 sysctl_apply() {
-  cat > "$SYSCTL_FILE" <<EOF
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
-net.ipv4.conf.lo.rp_filter = 0
-net.netfilter.nf_conntrack_max = 1048576
-net.netfilter.nf_conntrack_tcp_timeout_established = 7200
-net.core.rmem_max = 26214400
-net.core.wmem_max = 26214400
-net.core.netdev_max_backlog = 250000
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_notsent_lowat = 16384
-EOF
-  sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1
+  local kv body="" cur hs
+  for kv in "${SYSCTL_LIST[@]}"; do body+="${kv/=/ = }"$'\n'; done
+  cur=$(cat "$SYSCTL_FILE" 2>/dev/null)
+  [[ "$cur" == "${body%$'\n'}" ]] || printf '%s' "$body" > "$SYSCTL_FILE"
+  for kv in "${SYSCTL_LIST[@]}"; do sysctl -qw "$kv" >/dev/null 2>&1; done
+  if [[ -w /sys/module/nf_conntrack/parameters/hashsize ]]; then
+    read -r hs < /sys/module/nf_conntrack/parameters/hashsize
+    [[ $hs =~ ^[0-9]+$ ]] && (( hs < 131072 )) && echo 131072 > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null
+  fi
   sysctl -qw "net.ipv4.conf.${IF_NAME}.rp_filter=0" >/dev/null 2>&1
   return 0
 }
 
-iface_setup() {
+# cheap guard: other tools (ufw, sysctl --system, cloud-init) like to reset these
+sysctl_verify() {
+  local f p
+  if [[ $(< /proc/sys/net/ipv4/ip_forward) != 1 ]]; then
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    rlog fwd "ip_forward had been reset to 0 -> restored"
+  fi
+  for f in all default lo "$IF_NAME"; do
+    p=/proc/sys/net/ipv4/conf/$f/rp_filter
+    if [[ -e $p && $(< "$p") != 0 ]]; then
+      echo 0 > "$p"
+      rlog rpf "rp_filter on $f had been changed -> restored"
+    fi
+  done
+}
+
+# ------------------------------------------------------------------------------
+#  Interface
+# ------------------------------------------------------------------------------
+iface_create() {
   local out
   ip link del "$IF_NAME" 2>/dev/null
   if ! out=$(ip link add "$IF_NAME" type xfrm dev "$WAN_DEV" if_id "$IF_ID" 2>&1); then
-    log "ERROR: cannot create $IF_NAME: $out"; return 1
+    rlog ifc "ERROR: cannot create $IF_NAME: $out"; return 1
   fi
   ip addr add "${LOCAL_INNER}/${NET_PREFIX}" dev "$IF_NAME" || return 1
   ip link set "$IF_NAME" mtu "$MTU" up || return 1
@@ -383,6 +638,32 @@ iface_setup() {
   return 0
 }
 
+ensure_iface() {
+  local cur flags
+  if [[ ! -d /sys/class/net/$IF_NAME ]]; then
+    log "interface $IF_NAME missing -> creating"
+    iface_create; return
+  fi
+  if ! ip -4 -o addr show dev "$IF_NAME" 2>/dev/null | grep -qF "${LOCAL_INNER}/${NET_PREFIX}"; then
+    log "address ${LOCAL_INNER}/${NET_PREFIX} missing on $IF_NAME -> re-adding"
+    ip addr add "${LOCAL_INNER}/${NET_PREFIX}" dev "$IF_NAME" 2>/dev/null
+  fi
+  read -r cur < "/sys/class/net/$IF_NAME/mtu"
+  if [[ $cur != "$MTU" ]]; then
+    log "MTU on $IF_NAME is $cur, expected $MTU -> fixing"
+    ip link set "$IF_NAME" mtu "$MTU"
+  fi
+  read -r flags < "/sys/class/net/$IF_NAME/flags"
+  if (( (flags & 1) == 0 )); then
+    log "$IF_NAME was down -> bringing up"
+    ip link set "$IF_NAME" up
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+#  XFRM policies (idempotent; never delete+add while traffic flows)
+# ------------------------------------------------------------------------------
 policies_remove() {
   local a b
   for a in "$IP_IRAN" "$IP_KHAREJ"; do
@@ -393,121 +674,193 @@ policies_remove() {
   done
 }
 
-# v1.5: idempotent - never delete/re-add policies while traffic flows
-policies_ensure() {
-  local n
-  n=$(ip xfrm policy list 2>/dev/null | grep -c "if_id ${IF_ID}")
-  if (( n >= 3 )); then return 0; fi
-  policies_remove
-  ip xfrm policy add src "$LOCAL_INNER/32" dst "$PEER_INNER/32" dir out if_id "$IF_ID" \
-     tmpl src "$LOCAL_ADDR" dst "$PEER_PUB" proto esp reqid "$IF_ID" mode tunnel >/dev/null 2>&1 || return 1
-  ip xfrm policy add src "$PEER_INNER/32" dst "$LOCAL_INNER/32" dir in if_id "$IF_ID" \
-     tmpl src "$PEER_PUB" dst "$LOCAL_ADDR" proto esp reqid "$IF_ID" mode tunnel >/dev/null 2>&1 || return 1
-  ip xfrm policy add src "$PEER_INNER/32" dst 0.0.0.0/0 dir fwd if_id "$IF_ID" \
-     tmpl src "$PEER_PUB" dst "$LOCAL_ADDR" proto esp reqid "$IF_ID" mode tunnel >/dev/null 2>&1 || return 1
+# `update` = atomic add-or-replace (no gap between delete and add)
+pol_apply() {
+  local out rc=0
+  out=$(ip xfrm policy update src "$LOCAL_INNER/32" dst "$PEER_INNER/32" dir out if_id "$IF_ID" \
+        tmpl src "$LOCAL_ADDR" dst "$PEER_PUB" proto esp reqid "$IF_ID" mode tunnel 2>&1) \
+        || { log "ERROR: policy out: $out"; rc=1; }
+  out=$(ip xfrm policy update src "$PEER_INNER/32" dst "$LOCAL_INNER/32" dir in if_id "$IF_ID" \
+        tmpl src "$PEER_PUB" dst "$LOCAL_ADDR" proto esp reqid "$IF_ID" mode tunnel 2>&1) \
+        || { log "ERROR: policy in: $out"; rc=1; }
+  out=$(ip xfrm policy update src "$PEER_INNER/32" dst 0.0.0.0/0 dir fwd if_id "$IF_ID" \
+        tmpl src "$PEER_PUB" dst "$LOCAL_ADDR" proto esp reqid "$IF_ID" mode tunnel 2>&1) \
+        || { log "ERROR: policy fwd: $out"; rc=1; }
+  return $rc
+}
+
+ensure_policies() {
+  local sig="$LOCAL_ADDR|$PEER_PUB" n
+  # iproute2 prints if_id in hex (0x2a); accept both notations
+  n=$(ip xfrm policy 2>/dev/null | grep -Ec "if_id (0x0*${IF_HEX}|${IF_ID})([^0-9a-fA-F]|$)")
+  if [[ $POL_SIG == "$sig" ]] && (( n >= 3 )); then return 0; fi
+  now_s
+  # if the count method itself is unreliable on some iproute2, do not hammer the kernel
+  if [[ $POL_SIG == "$sig" ]] && (( NOW - POL_FAIL_TS < 60 )); then return 0; fi
+  POL_FAIL_TS=$NOW
+  log "XFRM policies incomplete/outdated (found $n/3) -> atomic refresh"
+  pol_apply || return 1
+  POL_SIG=$sig
   return 0
 }
 
-policies_setup() { policies_ensure; }
+# ------------------------------------------------------------------------------
+#  XFRM states (SAs): verified against the kernel, not a text registry
+# ------------------------------------------------------------------------------
+kernel_sas() {      # prints: "src dst spi" for every SA that belongs to us
+  ip xfrm state 2>/dev/null | awk -v rq="$IF_ID" '
+    /^src /  { src=$2; dst=$4; next }
+    /^[ \t]+proto esp/ {
+      spi=""; r=""
+      for (i=1;i<=NF;i++) { if ($i=="spi") spi=$(i+1); if ($i=="reqid") r=$(i+1) }
+      sub(/\(.*/, "", spi); sub(/\(.*/, "", r)
+      if (r==rq) print src, dst, spi
+    }'
+}
 
-sa_add() {
-  local dir=$1 e=$2 src dst label spi key out
-  local -a args=()
-  if [[ $dir == out ]]; then src=$LOCAL_ADDR; dst=$PEER_PUB;  label=$OUT_LABEL
-  else                       src=$PEER_PUB;   dst=$LOCAL_ADDR; label=$IN_LABEL
+derive() {          # derive DIR EPOCH -> D_SRC D_DST D_SPI D_KEY  (same math as v1.5)
+  local dir=$1 e=$2 label h k
+  if [[ $dir == out ]]; then label=$OUT_LABEL; D_SRC=$LOCAL_ADDR; D_DST=$PEER_PUB
+  else                       label=$IN_LABEL;  D_SRC=$PEER_PUB;   D_DST=$LOCAL_ADDR
   fi
-
-  # بررسی تغییر IP و پاکسازی SA قدیمی در صورت تغییر
-  local old_line=$(grep "^$dir $e " "$REG" 2>/dev/null)
-  if [[ -n "$old_line" ]]; then
-    local old_src=$(echo "$old_line" | awk '{print $4}')
-    local old_dst=$(echo "$old_line" | awk '{print $5}')
-    if [[ "$old_src" == "$src" && "$old_dst" == "$dst" ]]; then
-      return 0 # قبلاً وجود دارد و مطابقت دارد
-    else
-      local old_spi=$(echo "$old_line" | awk '{print $3}')
-      ip xfrm state delete src "$old_src" dst "$old_dst" proto esp spi "$old_spi" 2>/dev/null
-      grep -v "^$dir $e " "$REG" > "${REG}.tmp" 2>/dev/null && mv "${REG}.tmp" "$REG"
-    fi
+  k="${label}|${e}"
+  if [[ -z ${SPI_C[$k]:-} ]]; then
+    h=$(kdf "${MASTER}|spi|${label}|${e}"); SPI_C[$k]="0x1${h:0:7}"
+    h=$(kdf "${MASTER}|key|${label}|${e}"); KEY_C[$k]=${h:0:72}
   fi
+  D_SPI=${SPI_C[$k]}; D_KEY=${KEY_C[$k]}
+}
 
-  spi="0x1$(kdf "${MASTER}|spi|${label}|${e}" | cut -c1-7)"
-  key=$(kdf "${MASTER}|key|${label}|${e}" | cut -c1-72)
-
-  args=(src "$src" dst "$dst" proto esp spi "$spi" reqid "$IF_ID" mode tunnel
-        replay-window 0
-        aead 'rfc4106(gcm(aes))' "0x${key}" 128)
+sa_install() {      # uses D_* ; args: dir epoch
+  local out
+  local -a args=(src "$D_SRC" dst "$D_DST" proto esp spi "$D_SPI" reqid "$IF_ID" mode tunnel
+                 replay-window 0
+                 aead 'rfc4106(gcm(aes))' "0x${D_KEY}" 128)
   if [[ $MODE == udp ]]; then args+=(encap espinudp "$UDP_PORT" "$UDP_PORT" 0.0.0.0); fi
   args+=(if_id "$IF_ID")
-
   if ! out=$(ip xfrm state add "${args[@]}" 2>&1); then
-    log "ERROR: cannot add SA: $out"; return 1
+    rlog sa "ERROR: cannot add SA ($1 epoch $2): $out"
+    return 1
   fi
-  echo "$dir $e $spi $src $dst" >> "$REG"
   return 0
 }
 
-prune_sa() {
-  local e=$1 dir ep spi src dst keep tmp
-  [[ -f $REG ]] || return 0
-  tmp=$(mktemp)
-  while read -r dir ep spi src dst; do
-    [[ -n $spi ]] || continue
-    keep=1
-    if [[ $dir == out ]]; then
-      (( ep != e )) && keep=0
-    else
-      # v1.5: in-key window e-2..e+3 (was e-2..e+2) -> extra clock-skew tolerance
-      (( ep < e - 2 || ep > e + 3 )) && keep=0
-    fi
-    if (( keep )); then
-      echo "$dir $ep $spi $src $dst" >> "$tmp"
-    else
-      ip xfrm state delete src "$src" dst "$dst" proto esp spi "$spi" 2>/dev/null
-    fi
-  done < "$REG"
-  cat "$tmp" > "$REG"
-  rm -f "$tmp"
+sa_delete() {       # "src dst spi"
+  local s d p
+  read -r s d p <<<"$1"
+  ip xfrm state delete src "$s" dst "$d" proto esp spi "$p" 2>/dev/null
 }
 
-install_epoch() {
-  local e=$1 x
-  sa_add out "$e" || return 1
-  # نصب کلیدهای ورودی برای بازه e-2..e+3 برای تحمل Clock Skew بدون قطعی
-  for x in $((e - 2)) $((e - 1)) "$e" $((e + 1)) $((e + 2)) $((e + 3)); do
-    sa_add in "$x" || return 1
+ensure_sas() {
+  local e x item dir ep line rc=0 prev=$CUR_EPOCH
+  local -a plan=()
+  local -A want=() have=() wspi=()
+
+  now_s; e=$(( NOW / EPOCH_LEN ))
+  plan=("out $e")
+  for (( x = e - IN_BACK; x <= e + IN_FWD; x++ )); do plan+=("in $x"); done
+
+  while read -r line; do [[ -n $line ]] && have[$line]=1; done < <(kernel_sas)
+
+  for item in "${plan[@]}"; do
+    read -r dir ep <<<"$item"
+    derive "$dir" "$ep"
+    want["$D_SRC $D_DST $D_SPI"]=1
+    wspi[$D_SPI]=1
   done
-  prune_sa "$e"
-  return 0
+
+  # 1) same SPI but wrong addresses (public IP changed) -> remove first
+  for line in "${!have[@]}"; do
+    read -r _ _ x <<<"$line"
+    if [[ -n ${wspi[$x]:-} && -z ${want[$line]:-} ]]; then
+      log "removing SA with outdated addresses: $line"
+      sa_delete "$line"
+    fi
+  done
+
+  # 2) add whatever is missing (new keys go in BEFORE old ones are removed)
+  for item in "${plan[@]}"; do
+    read -r dir ep <<<"$item"
+    derive "$dir" "$ep"
+    [[ -n ${have["$D_SRC $D_DST $D_SPI"]:-} ]] && continue
+    sa_install "$dir" "$ep" || rc=1
+  done
+
+  # 3) drop SAs of expired epochs
+  for line in "${!have[@]}"; do
+    read -r _ _ x <<<"$line"
+    [[ -z ${wspi[$x]:-} ]] && sa_delete "$line"
+  done
+
+  if (( rc == 0 )); then
+    if (( prev != 0 && prev != e )); then log "key rotation: epoch $prev -> $e"; fi
+    CUR_EPOCH=$e
+  fi
+  return $rc
 }
 
 sa_flush() {
-  local dir ep spi src dst
-  if [[ -f $REG ]]; then
-    while read -r dir ep spi src dst; do
-      [[ -n $spi ]] && ip xfrm state delete src "$src" dst "$dst" proto esp spi "$spi" 2>/dev/null
-    done < "$REG"
-  fi
-  rm -f "$REG"
+  local line
+  while read -r line; do
+    [[ -n $line ]] && sa_delete "$line"
+  done < <(kernel_sas)
+}
+
+# ------------------------------------------------------------------------------
+#  UDP encapsulation helper (socket that arms UDP_ENCAP_ESPINUDP)
+# ------------------------------------------------------------------------------
+udp_port_bound() {
+  ss -uln 2>/dev/null | awk -v p=":${UDP_PORT}" '$4 ~ (p "$") {f=1} END{exit !f}'
+}
+
+udp_helper_alive() {
+  [[ -f $UDP_PID_FILE ]] && kill -0 "$(< "$UDP_PID_FILE")" 2>/dev/null
 }
 
 udp_helper_stop() {
   if [[ -f $UDP_PID_FILE ]]; then
-    kill "$(cat "$UDP_PID_FILE" 2>/dev/null)" 2>/dev/null
+    kill "$(< "$UDP_PID_FILE")" 2>/dev/null
     rm -f "$UDP_PID_FILE"
   fi
 }
 
 udp_helper_start() {
+  local i
   udp_helper_stop
-  python3 -c "$PY_UDP" "$UDP_PORT" >/dev/null 2>&1 &
+  mkdir -p "$RUN_DIR"
+  python3 -c "$PY_UDP" "$UDP_PORT" >/dev/null 2>"$UDP_ERR_FILE" &
   echo $! > "$UDP_PID_FILE"
-  sleep 0.5
-  if ! kill -0 "$(cat "$UDP_PID_FILE")" 2>/dev/null; then
-    log "ERROR: cannot open UDP port $UDP_PORT"
-    return 1
+  for i in 1 2 3 4 5 6 7 8; do
+    sleep 0.25
+    if udp_helper_alive && udp_port_bound; then return 0; fi
+  done
+  log "ERROR: cannot open UDP port $UDP_PORT: $(tail -n 1 "$UDP_ERR_FILE" 2>/dev/null)"
+  return 1
+}
+
+ensure_udp() {
+  [[ $MODE == udp ]] || return 0
+  if udp_helper_alive && udp_port_bound; then return 0; fi
+  rlog udp "UDP helper not healthy -> restarting"
+  udp_helper_start
+}
+
+# ------------------------------------------------------------------------------
+#  Reconcile / setup / teardown
+# ------------------------------------------------------------------------------
+ensure_all() {
+  local rc=0 old=$LOCAL_ADDR
+  if ! route_info "$PEER_PUB"; then
+    rlog route "WARN: no route to peer $PEER_PUB (keeping current state)"
+    [[ -n $LOCAL_ADDR ]] || return 1
+  elif [[ -n $old && $old != "$LOCAL_ADDR" ]]; then
+    log "local source address changed $old -> $LOCAL_ADDR (policies/SAs will follow)"
   fi
-  return 0
+  ensure_iface    || rc=1
+  ensure_policies || rc=1
+  ensure_sas      || rc=1
+  ensure_udp      || rc=1
+  return $rc
 }
 
 teardown_all() {
@@ -516,52 +869,36 @@ teardown_all() {
   sa_flush
   policies_remove
   ip link del "$IF_NAME" 2>/dev/null
+  POL_SIG=""; FW_SIG=""
   return 0
 }
 
 setup_all() {
   teardown_all
-  mkdir -p "$RUN_DIR"; : > "$REG"
+  mkdir -p "$RUN_DIR"
   load_modules
   route_info "$PEER_PUB" || { log "ERROR: no route to peer $PEER_PUB"; return 1; }
-  iface_setup            || return 1
-  policies_ensure        || return 1
-  CUR_EPOCH=$(( $(date +%s) / EPOCH_LEN ))
-  install_epoch "$CUR_EPOCH" || return 1
-  if [[ $MODE == udp ]]; then udp_helper_start || return 1; fi
+  CUR_EPOCH=0
   sysctl_apply
+  ensure_all || log "WARN: setup incomplete, reconcile loop will keep repairing"
   fw_apply
-  log "tunnel up: $LOCAL_INNER <-> $PEER_INNER mode=$MODE port=$UDP_PORT epoch=$CUR_EPOCH"
+  log "tunnel up: $LOCAL_INNER <-> $PEER_INNER mode=$MODE port=$UDP_PORT mtu=$MTU epoch=$CUR_EPOCH"
   return 0
 }
 
-# v1.5: soft-heal is now fully idempotent (no policy delete/add, no fw reset)
-soft_heal() {
-  log "running soft self-healing..."
-  route_info "$PEER_PUB" || return 1
-  if [[ $MODE == udp ]]; then
-    if [[ ! -f $UDP_PID_FILE ]] || ! kill -0 "$(cat "$UDP_PID_FILE" 2>/dev/null)" 2>/dev/null; then
-      udp_helper_start
-    fi
-  fi
-  CUR_EPOCH=$(( $(date +%s) / EPOCH_LEN ))
-  install_epoch "$CUR_EPOCH" || return 1
-  policies_ensure || return 1
-  sysctl_apply
-  return 0
-}
-
-# ---- v1.5: RTT-adaptive probing ----
+# ------------------------------------------------------------------------------
+#  Probing / diagnostics
+# ------------------------------------------------------------------------------
 measure_rtt() {
   local avg ms
-  avg=$(ping -c 4 -W 2 -I "$IF_NAME" "$PEER_INNER" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
+  avg=$(ping -c 4 -W 3 -I "$IF_NAME" "$PEER_INNER" 2>/dev/null | awk -F'/' '/rtt|round-trip/{print $5}')
   [[ -n $avg ]] || return 0
   ms=${avg%%.*}
   [[ $ms =~ ^[0-9]+$ ]] || return 0
-  PROBE_W=$(( ms * 2 / 1000 + 2 ))
-  (( PROBE_W < 2 )) && PROBE_W=2
+  PROBE_W=$(( ms * 2 / 1000 + 3 ))
+  (( PROBE_W < 3 )) && PROBE_W=3
   (( PROBE_W > 10 )) && PROBE_W=10
-  log "adaptive probe timeout set to ${PROBE_W}s (baseline RTT ${ms}ms)"
+  log "adaptive probe timeout ${PROBE_W}s (baseline RTT ${ms}ms)"
 }
 
 peer_probe_ok() {
@@ -571,101 +908,130 @@ peer_probe_ok() {
   [[ ${rcv:-0} -ge 1 ]]
 }
 
-# v1.5: watchdog never tears the tunnel down on first sight of trouble.
-# soft-heal first (x3), full rebuild only as last resort, with cooldown + jitter.
-watchdog_rebuild() {
-  local reason=$1 a
-  log "watchdog: $reason"
-  for a in 1 2 3; do
-    if soft_heal && peer_probe_ok; then
-      log "watchdog: recovered via soft-heal (attempt $a); interface untouched."
-      break
-    fi
-    log "watchdog: soft-heal attempt $a failed"
-    (( a < 3 )) && sleep 5
-  done
-  if ! peer_probe_ok; then
-    log "watchdog: soft-heal exhausted; performing full rebuild as last resort..."
-    sleep $(( RANDOM % 11 ))   # desynchronize the two ends to avoid double teardown
-    setup_all
+diag_log() {
+  local k v d out=""
+  now_s
+  if [[ ! -r /proc/net/xfrm_stat ]]; then
+    log "diag: epoch=$(( NOW / EPOCH_LEN )) utc=$(date -u +%H:%M:%S) (kernel has no xfrm_stat)"
+    return 0
   fi
-  LAST_REBUILD=$(date +%s)
-  FAILS=0
-  PEER_STATE="unknown"
+  for k in XfrmInNoStates XfrmInStateProtoError XfrmInStateMismatch XfrmInError XfrmInNoPols \
+           XfrmInPolBlock XfrmInPolError XfrmOutNoStates XfrmOutPolBlock XfrmOutPolError XfrmOutStateSeqError; do
+    v=$(xfrm_stat "$k"); v=${v:-0}
+    d=$(( v - ${XS_PREV[$k]:-0} ))
+    XS_PREV[$k]=$v
+    (( d > 0 )) && out+=" $k+$d"
+  done
+  log "diag: epoch=$(( NOW / EPOCH_LEN )) utc=$(date -u +%H:%M:%S) xfrm_delta:${out:- none}"
+  if   [[ $out == *XfrmInNoStates* ]]; then
+    log "diag: peer sends ESP with SPIs we do not hold -> clock/epoch mismatch or different MASTER. Compare 'date -u' and NTP on BOTH servers."
+  elif [[ $out == *XfrmInStateProtoError* || $out == *XfrmInError* ]]; then
+    log "diag: ESP decrypt errors -> wrong key or damaged packets (MTU / fragmentation on the path?)."
+  elif [[ $out == *XfrmInNoPols* || $out == *XfrmInPolBlock* ]]; then
+    log "diag: inbound policy problem (policies are verified every ${TICK}s)."
+  elif [[ $out == *XfrmOutNoStates* ]]; then
+    log "diag: no outbound SA at the moment (SAs are verified every ${TICK}s)."
+  elif [[ -z $out ]]; then
+    log "diag: nothing arrives from the peer -> ISP/underlay drop, peer service down, or UDP $UDP_PORT blocked."
+  fi
 }
 
+# ------------------------------------------------------------------------------
+#  Daemon
+# ------------------------------------------------------------------------------
 cmd_daemon() {
-  local tries=0 e now
+  local tries=0 tick=0
   load_config || { log "ERROR: missing config"; exit 1; }
   mkdir -p "$RUN_DIR"
   trap 'log "stop signal received"; exit 0' TERM INT
+  trap 'RELOAD=1' HUP
 
   until route_info "$PEER_PUB"; do
-    (( ++tries > 30 )) && { log "ERROR: no route to $PEER_PUB"; exit 1; }
+    (( ++tries > 60 )) && { log "ERROR: no route to $PEER_PUB"; exit 1; }
     sleep 2
   done
-  setup_all || { log "ERROR: setup failed"; exit 1; }
-  LAST_REBUILD=$(date +%s)
+  load_modules
+  log "starting v${VERSION} role=$ROLE mode=$MODE mtu=$MTU peer=$PEER_PUB notrack=$NOTRACK"
+  time_synced || log "WARN: system clock is not NTP-synchronized (keys are time based!)"
+  legacy_found && log "WARN: legacy watcher (cron/timer) found - it may restart this service. Run: $BIN cleanup"
+
+  sysctl_apply
+  ensure_all || log "WARN: initial setup incomplete; reconcile loop will retry"
+  fw_apply
+  now_s; LAST_REBUILD=$NOW
+  log "tunnel up: $LOCAL_INNER <-> $PEER_INNER epoch=$CUR_EPOCH"
   measure_rtt
 
   while true; do
-    sleep 5 &
+    sleep "$TICK" &
     wait $!
-    now=$(date +%s)
 
-    # 1. Hourly key rotation (graceful; failure keeps old keys and logs)
-    e=$(( now / EPOCH_LEN ))
-    if (( e != CUR_EPOCH )); then
-      log "key rotation: epoch $CUR_EPOCH -> $e"
-      if install_epoch "$e"; then
-        CUR_EPOCH=$e
+    if (( RELOAD )); then
+      RELOAD=0
+      log "reload requested (SIGHUP)"
+      if load_config; then
+        sysctl_apply; ensure_all; fw_apply
+        log "reloaded: mtu=$MTU ports=${PORTS:-n/a} notrack=$NOTRACK"
       else
-        log "ERROR: rotation failed; keeping previous keys (peer window tolerates this)"
+        log "WARN: reload failed, keeping previous settings"
       fi
     fi
 
-    # 2. UDP helper liveness
-    if [[ $MODE == udp ]]; then
-      if [[ ! -f $UDP_PID_FILE ]] || ! kill -0 "$(cat "$UDP_PID_FILE" 2>/dev/null)" 2>/dev/null; then
-        log "WARN: UDP helper died! Reviving..."
-        udp_helper_start
-      fi
-    fi
+    # --- 1. reconcile local state (cheap, silent when healthy) ---
+    ensure_all
+    sysctl_verify
+    (( ++tick % FW_EVERY == 0 )) && fw_verify
 
-    # 3. Interface liveness
-    if ! ip link show "$IF_NAME" >/dev/null 2>&1; then
-      watchdog_rebuild "interface $IF_NAME vanished"
-      continue
-    fi
-
-    # 4. Probe-based peer detection (v1.5: no more raw byte-stall false positives)
+    # --- 2. peer probe (also acts as NAT / conntrack keepalive) ---
+    now_s
     if peer_probe_ok; then
-      if [[ $PEER_STATE != up ]]; then log "peer reachable again"; fi
-      PEER_STATE=up
-      FAILS=0
+      if [[ $PEER_STATE != up ]]; then
+        if (( DOWN_SINCE > 0 )); then log "peer reachable again (silent for $(( NOW - DOWN_SINCE ))s)"
+        else log "peer reachable"; fi
+      fi
+      PEER_STATE=up; FAILS=0; DOWN_SINCE=0
     else
       FAILS=$(( FAILS + 1 ))
-      PEER_STATE=down
-      if (( FAILS >= MAX_FAILS )); then
-        if (( now - LAST_REBUILD >= MIN_REBUILD_GAP )); then
-          watchdog_rebuild "peer unreachable for ~$(( MAX_FAILS * 5 ))s"
-        else
-          log "peer down but rebuild cooldown active; soft-heal only"
-          soft_heal
-        fi
-        FAILS=0
+      (( DOWN_SINCE == 0 )) && DOWN_SINCE=$NOW
+      if (( FAILS == FAIL_WARN )); then
+        PEER_STATE=down
+        log "peer silent for ~$(( NOW - DOWN_SINCE ))s; local state verified OK, waiting (no teardown)"
+        diag_log
+      elif (( FAILS > FAIL_WARN && FAILS % 12 == 0 )); then
+        diag_log
+      fi
+      if (( NOW - DOWN_SINCE >= DOWN_REBUILD_SEC && NOW - LAST_REBUILD >= REBUILD_COOLDOWN )); then
+        log "peer silent for $(( NOW - DOWN_SINCE ))s -> last-resort full rebuild"
+        setup_all
+        now_s; LAST_REBUILD=$NOW; DOWN_SINCE=$NOW
       fi
     fi
   done
 }
 
 cmd_teardown() { teardown_all; log "tunnel torn down"; }
+
+# systemd ExecStopPost: tear down only on a deliberate stop/restart. After a crash
+# (SERVICE_RESULT != success) keep the live state so the new daemon adopts it.
+cmd_stoppost() {
+  if [[ ${SERVICE_RESULT:-success} == success ]]; then
+    teardown_all
+  fi
+}
+
 cmd_fw() { load_config || exit 1; route_info "$PEER_PUB" || exit 1; fw_apply; }
 
+# ------------------------------------------------------------------------------
+#  Install / service
+# ------------------------------------------------------------------------------
 install_self() {
   local src
   src=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
-  [[ -f $src ]] || return 1
+  if [[ ! -f $src ]]; then
+    err "Cannot read the script file (piped execution?). Save it first, e.g.:"
+    err "  curl -fsSL <URL> -o esp-tunnel.sh && bash esp-tunnel.sh"
+    return 1
+  fi
   [[ $src != "$BIN" ]] && install -m 755 "$src" "$BIN"
   return 0
 }
@@ -674,16 +1040,19 @@ write_unit() {
   cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=ESP Tunnel Service (${APP})
-After=network-online.target
-Wants=network-online.target
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=${BIN} daemon
-ExecStopPost=${BIN} teardown
+ExecStopPost=${BIN} stoppost
 Restart=always
-RestartSec=3
+RestartSec=2
+TimeoutStopSec=20
+Nice=-5
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -691,16 +1060,19 @@ EOF
 }
 
 start_service() {
+  local i
   write_unit
   systemctl daemon-reload
   systemctl enable "$APP" >/dev/null 2>&1
   systemctl restart "$APP"
-  sleep 2
-  if systemctl is-active --quiet "$APP" && ip link show "$IF_NAME" >/dev/null 2>&1; then
-    ok "Tunnel service started successfully."
-    return 0
-  fi
-  err "Service failed to start."
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    if systemctl is-active --quiet "$APP" && ip link show "$IF_NAME" >/dev/null 2>&1; then
+      ok "Tunnel service started successfully."
+      return 0
+    fi
+  done
+  err "Service failed to start. Check: journalctl -u $APP -n 50"
   return 1
 }
 
@@ -730,6 +1102,14 @@ ask_fwd_proto() {
   case $c in 2) FWD_PROTO=tcp ;; 3) FWD_PROTO=udp ;; *) FWD_PROTO=both ;; esac
 }
 
+confirm_reinstall() {
+  if load_config 2>/dev/null; then
+    warn "Already configured as $ROLE."
+    confirm "Overwrite?" n || return 1
+  fi
+  return 0
+}
+
 setup_iran() {
   confirm_reinstall || return
   install_self || return
@@ -753,8 +1133,13 @@ setup_iran() {
   MASTER="$STATIC_MASTER"
   MODE="$DEFAULT_MODE"
   UDP_PORT="$DEFAULT_UDP_PORT"
+  MTU_OVERRIDE=""
+  NOTRACK=1
 
-  write_config; load_config; start_service || return
+  write_config; load_config
+  legacy_clean
+  ensure_time_sync
+  start_service || return
   echo
   ok "Iran server setup complete!"
   echo "${C_G}No token copy-paste needed!${C_0}"
@@ -785,31 +1170,120 @@ setup_kharej() {
   UDP_PORT="$DEFAULT_UDP_PORT"
   PORTS=""
   FWD_PROTO="both"
+  MTU_OVERRIDE=""
+  NOTRACK=1
 
-  write_config; load_config; start_service || return
+  write_config; load_config
+  legacy_clean
+  ensure_time_sync
+  start_service || return
   echo
   info "Testing ping to Iran (${PEER_INNER})..."
-  ping -c 4 -W 1 -I "$IF_NAME" "$PEER_INNER"
+  ping -c 4 -W 2 -I "$IF_NAME" "$PEER_INNER"
   echo
-  ok "Kharej client connected successfully using static auto-token!"
+  ok "Kharej client connected using static auto-token!"
   pause
 }
 
-confirm_reinstall() {
-  if load_config 2>/dev/null; then
-    warn "Already configured as $ROLE."
-    confirm "Overwrite?" n || return 1
-  fi
-  return 0
+cmd_upgrade() {
+  load_config || { err "Not installed yet: use option 1 or 2 first."; return 1; }
+  install_self || return 1
+  legacy_clean
+  ensure_time_sync
+  start_service
 }
 
+# ------------------------------------------------------------------------------
+#  Status / tools
+# ------------------------------------------------------------------------------
 cmd_status() {
+  local k v
   load_config || { warn "Not installed."; return; }
-  echo "Role: $ROLE | Mode: $MODE | UDP Port: $UDP_PORT | Epoch: $CUR_EPOCH | ProbeTimeout: ${PROBE_W}s"
-  echo "Service: $(systemctl is-active "$APP")"
+  now_s; fw_define
+  echo "Version: v${VERSION} | Role: $ROLE | Mode: $MODE | UDP Port: $UDP_PORT | MTU: $MTU${MTU_OVERRIDE:+ (override)} | Epoch: $(( NOW / EPOCH_LEN )) | NOTRACK: $NOTRACK"
+  echo "Service: $(systemctl is-active "$APP") | Clock NTP-synced: $(time_synced && echo yes || echo NO)"
   ip -br addr show "$IF_NAME" 2>/dev/null
+  echo "SAs in kernel: $(kernel_sas | wc -l) (expected $(( IN_BACK + IN_FWD + 2 )))"
+  if [[ -r /proc/net/xfrm_stat ]]; then
+    for k in XfrmInNoStates XfrmInStateProtoError XfrmInError XfrmInNoPols XfrmOutNoStates XfrmOutPolBlock; do
+      v=$(xfrm_stat "$k"); [[ ${v:-0} -gt 0 ]] && echo "  counter $k = $v"
+    done
+  fi
+  local spec ft fc fwmiss=0
+  for spec in "${FW_SPECS[@]}"; do
+    read -r ft fc _ <<<"$spec"
+    iptables -w 5 -t "$ft" -S "$fc" >/dev/null 2>&1 || { echo "  firewall chain missing: $ft/$fc"; fwmiss=1; }
+  done
+  (( fwmiss )) || echo "Firewall chains: OK"
+  legacy_found && warn "Legacy watcher found (may restart the tunnel). Run: $BIN cleanup"
   echo "Ping test:"
-  ping -c 4 -W 1 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 2
+  ping -c 4 -W 2 -I "$IF_NAME" "$PEER_INNER" 2>&1 | tail -n 2
+}
+
+mtu_try() { ping -M 'do' -s "$1" -c 3 -i 0.3 -W 2 "$PEER_PUB" >/dev/null 2>&1; }
+
+cmd_mtu_test() {
+  load_config || { warn "Not installed."; return 1; }
+  local lo=1200 hi=1472 mid pmtu rec ovh
+  info "Measuring underlay path MTU to $PEER_PUB (ICMP, DF bit set) ..."
+  if ! ping -c 3 -W 2 "$PEER_PUB" >/dev/null 2>&1; then
+    warn "Peer does not answer ICMP, cannot measure. Keep the default MTU ($MTU) or set one manually."
+    return 1
+  fi
+  if mtu_try "$hi"; then
+    lo=$hi
+  elif mtu_try "$lo"; then
+    hi=$(( hi - 1 ))
+    while (( lo < hi )); do
+      mid=$(( (lo + hi + 1) / 2 ))
+      if mtu_try "$mid"; then lo=$mid; else hi=$(( mid - 1 )); fi
+    done
+  else
+    warn "Even a ${lo}-byte payload fails (ICMP size filtering?). Result would be unreliable; keeping default."
+    return 1
+  fi
+  pmtu=$(( lo + 28 ))
+  if [[ $MODE == udp ]]; then ovh=65; else ovh=57; fi
+  rec=$(( (pmtu - ovh) / 4 * 4 ))
+  (( rec < 1200 )) && rec=1200
+  (( rec > 1500 )) && rec=1500
+  echo "Path MTU (this -> peer): $pmtu | max tunnel MTU for $MODE mode: $rec | current: $MTU"
+  echo "Run this on BOTH servers and use the smaller value. ICMP filtering can under-report."
+  if (( rec != MTU )) && confirm "Apply MTU $rec on this server?" n; then
+    MTU_OVERRIDE=$rec
+    write_config
+    reload_daemon
+  fi
+}
+
+cmd_edit() {
+  load_config || { warn "Not installed."; return; }
+  local c v
+  while true; do
+    echo
+    echo "Current: MTU=$MTU (${MTU_OVERRIDE:-auto}) | NOTRACK=$NOTRACK | ports=${PORTS:-n/a} | proto=$FWD_PROTO"
+    echo "  1) Set MTU manually (1200-1500)"
+    echo "  2) Reset MTU to default (auto: $([[ $MODE == udp ]] && echo $MTU_UDP || echo $MTU_ESP))"
+    echo "  3) Toggle NOTRACK for the outer tunnel flow (on = less CPU)"
+    echo "  4) Change forwarded ports        (Iran only)"
+    echo "  5) Change forwarding protocol    (Iran only)"
+    echo "  0) Back"
+    read -r -p "Select: " c
+    case $c in
+      1) read -r -p "MTU: " v
+         if [[ $v =~ ^[0-9]+$ ]] && (( 10#$v >= 1200 && 10#$v <= 1500 )); then
+           MTU_OVERRIDE=$((10#$v)); write_config; load_config; reload_daemon
+         else err "Invalid MTU."; fi ;;
+      2) MTU_OVERRIDE=""; write_config; load_config; reload_daemon ;;
+      3) if (( NOTRACK )); then NOTRACK=0; else NOTRACK=1; fi
+         write_config; load_config; reload_daemon ;;
+      4) if [[ $ROLE == iran ]]; then ask_ports; write_config; load_config; reload_daemon
+         else warn "Ports are configured on the Iran server."; fi ;;
+      5) if [[ $ROLE == iran ]]; then ask_fwd_proto; write_config; load_config; reload_daemon
+         else warn "Forwarding protocol is configured on the Iran server."; fi ;;
+      0|q|Q) return ;;
+    esac
+  done
 }
 
 uninstall_all() {
@@ -823,16 +1297,21 @@ uninstall_all() {
 }
 
 menu() {
+  local ch
   while true; do
     echo
     echo "${C_B}======================================================${C_0}"
-    echo "${C_B}   ESP Tunnel Manager v${VERSION} (Stability Edition)   ${C_0}"
+    echo "${C_B}   ESP Tunnel Manager v${VERSION} (Zero-Drop Edition)     ${C_0}"
     echo "${C_B}======================================================${C_0}"
     echo "  1) Setup Iran Server"
     echo "  2) Setup Kharej Client"
     echo "  3) Status & Ping"
     echo "  4) Live Journal Log"
-    echo "  5) Uninstall"
+    echo "  5) Edit Settings (MTU / ports / ...)"
+    echo "  6) MTU Test (find the best MTU)"
+    echo "  7) Upgrade script & restart (keep config)"
+    echo "  8) Remove legacy watchers (old cron/healthcheck)"
+    echo "  9) Uninstall"
     echo "  0) Exit"
     echo
     read -r -p "Select: " ch
@@ -841,7 +1320,11 @@ menu() {
       2) setup_kharej ;;
       3) cmd_status; pause ;;
       4) journalctl -u "$APP" -f -n 30 ;;
-      5) uninstall_all; pause ;;
+      5) cmd_edit ;;
+      6) cmd_mtu_test; pause ;;
+      7) cmd_upgrade; pause ;;
+      8) legacy_clean; pause ;;
+      9) uninstall_all; pause ;;
       0|q|Q) exit 0 ;;
     esac
   done
@@ -849,12 +1332,17 @@ menu() {
 
 main() {
   case "${1:-menu}" in
-    menu)     need_root; menu ;;
-    status)   need_root; cmd_status ;;
-    daemon)   need_root; cmd_daemon ;;
-    teardown) need_root; cmd_teardown ;;
-    fw)       need_root; cmd_fw ;;
-    *)        exit 1 ;;
+    menu)              need_root; menu ;;
+    status)            need_root; cmd_status ;;
+    daemon)            need_root; cmd_daemon ;;
+    teardown)          need_root; cmd_teardown ;;
+    stoppost)          need_root; cmd_stoppost ;;
+    fw)                need_root; cmd_fw ;;
+    upgrade)           need_root; cmd_upgrade ;;
+    mtu-test)          need_root; cmd_mtu_test ;;
+    cleanup)           need_root; legacy_clean ;;
+    version|-v|--version) echo "${APP} v${VERSION}" ;;
+    *) echo "Usage: $0 {menu|status|upgrade|mtu-test|cleanup|version}"; exit 1 ;;
   esac
 }
 
