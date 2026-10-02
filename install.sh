@@ -756,6 +756,12 @@ ensure_sas() {
   local -a plan=()
   local -A want=() have=() wspi=()
 
+  # never touch the kernel with an incomplete address set
+  if [[ -z $LOCAL_ADDR || -z $PEER_PUB ]]; then
+    rlog sa "ERROR: LOCAL_ADDR/PEER_PUB empty - refusing to reconcile SAs"
+    return 1
+  fi
+
   now_s; e=$(( NOW / EPOCH_LEN ))
   plan=("out $e")
   for (( x = e - IN_BACK; x <= e + IN_FWD; x++ )); do plan+=("in $x"); done
@@ -772,6 +778,7 @@ ensure_sas() {
   # 1) same SPI but wrong addresses (public IP changed) -> remove first
   for line in "${!have[@]}"; do
     read -r _ _ x <<<"$line"
+    [[ -n $x ]] || continue
     if [[ -n ${wspi[$x]:-} && -z ${want[$line]:-} ]]; then
       log "removing SA with outdated addresses: $line"
       sa_delete "$line"
@@ -789,6 +796,7 @@ ensure_sas() {
   # 3) drop SAs of expired epochs
   for line in "${!have[@]}"; do
     read -r _ _ x <<<"$line"
+    [[ -n $x ]] || continue
     [[ -z ${wspi[$x]:-} ]] && sa_delete "$line"
   done
 
